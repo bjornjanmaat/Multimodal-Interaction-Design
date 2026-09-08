@@ -1,0 +1,29 @@
+# Environment variables and API keys
+.env
+**/.env
+
+# Large map tiles and data assets
+data/
+**/data/
+data/tiles/
+**/data/tiles/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Processing & IDE temporary files
+*.autosave
+applet/
+application.linux32/
+application.linux64/
+application.linux-arm/
+application.linux-arm64/
+application.macosx/
+application.windows32/
+application.windows64/
+
+# macOS system files
+.DS_Store
+**/.DS_Store
