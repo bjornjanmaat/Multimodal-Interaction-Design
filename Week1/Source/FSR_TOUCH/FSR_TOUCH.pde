@@ -13,21 +13,32 @@ float minZoom = 1.0;
 float maxZoom = 2.5;
 
 int fsrRaw = 0;
-int fsrMin = 50;    // Adjust: value when FSR is untouched
-int fsrMax = 900;   // Adjust: value at maximum pressure
+int fsrMin = 0;    // Adjust: value when FSR is untouched
+int fsrMax = 1200;   // Adjust: value at maximum pressure
 
 void setup() {
   size(1280, 720);
 
   printArray(Serial.list());
 
-  // Replace with your Arduino port.
-  arduino = new Serial(this, "/dev/cu.usbmodem1101", 9600);
-  arduino.bufferUntil('\n');
+  String portToUse = "/dev/cu.usbmodem1101";
+  File autoPortFile = new File("/tmp/trackpad_pressure_port.txt");
+  if (autoPortFile.exists()) {
+    String[] lines = loadStrings(autoPortFile);
+    if (lines != null && lines.length > 0 && lines[0].trim().length() > 0) {
+      portToUse = lines[0].trim();
+      println("📡 Auto-detected trackpad_pressure port: " + portToUse);
+    }
+  }
 
-  // Wait for Arduino to calibrate.
-  delay(2000);
-  arduino.clear();
+  try {
+    arduino = new Serial(this, portToUse, 9600);
+    arduino.bufferUntil('\n');
+    delay(200);
+    arduino.clear();
+  } catch (Exception e) {
+    println("Serial port warning: " + e.getMessage());
+  }
 
   loadImageList();
   loadRandomImage();
@@ -63,33 +74,30 @@ void draw() {
 }
 
 void serialEvent(Serial port) {
-  String message = port.readStringUntil('\n');
+  while (port.available() > 0) {
+    String message = port.readStringUntil('\n');
+    if (message == null) break;
+    message = trim(message);
+    if (message.length() == 0) continue;
 
-  if (message == null) return;
+    // Capacitive touch: load a new random image.
+    if (message.equals("TOUCH")) {
+      println("⚡ Touch detected — loading new image.");
+      loadRandomImage();
+      continue;
+    }
 
-  message = trim(message);
+    // Ignore the startup confirmation message.
+    if (message.equals("READY")) continue;
 
-  if (message.length() == 0) return;
-
-  // Capacitive touch: load a new random image.
-  if (message.equals("TOUCH")) {
-    println("Touch detected — loading new image.");
-    loadRandomImage();
-    return;
-  }
-
-  // Ignore the startup confirmation message.
-  if (message.equals("READY")) return;
-
-  // FSR
-  try {
-    fsrRaw = int(message);
-
-    targetZoom = map(fsrRaw, fsrMin, fsrMax, minZoom, maxZoom);
-    targetZoom = constrain(targetZoom, minZoom, maxZoom);
-
-  } catch (Exception e) {
-    println("Parse error: " + e.getMessage());
+    // FSR
+    try {
+      fsrRaw = int(message);
+      targetZoom = map(fsrRaw, fsrMin, fsrMax, minZoom, maxZoom);
+      targetZoom = constrain(targetZoom, minZoom, maxZoom);
+    } catch (Exception e) {
+      // ignore
+    }
   }
 }
 

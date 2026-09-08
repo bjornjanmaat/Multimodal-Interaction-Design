@@ -39,8 +39,14 @@ float targetRouteLineAlpha = 0.0;
 float smoothing = 0.08;
 
 int fsrRaw = 0;
-int fsrMin = 50;
-int fsrMax = 900;
+int fsrMin = 0;
+int fsrMax = 1200;
+
+String activePort = "None";
+boolean isSerialConnected = false;
+int lastSerialReceiveTime = 0;
+int lastTouchSwitchTime = 0;
+int lastReconnectAttempt = 0;
 
 // GPS Coordinates (Latitude, Longitude)
 class LatLon {
@@ -94,24 +100,46 @@ void setup() {
 
   printArray(Serial.list());
 
-  // Connect to Serial (Arduino or python3 arduino_simulator.py)
+  // Connect to Serial (Arduino or trackpad_pressure)
   try {
     String[] ports = Serial.list();
-    String portToUse = "/dev/ttys011"; // Default or auto-detected port
-    for (String p : ports) {
-      if (p.contains("tty.usbmodem") || p.contains("cu.usbmodem") || p.contains("ttys")) {
-        portToUse = p;
-        break;
+    String portToUse = "/dev/ttys031";
+
+    // 1. Auto-discover active trackpad_pressure simulator port
+    File autoPortFile = new File("/tmp/trackpad_pressure_port.txt");
+    if (autoPortFile.exists()) {
+      String[] lines = loadStrings(autoPortFile);
+      if (lines != null && lines.length > 0 && lines[0].trim().length() > 0) {
+        portToUse = lines[0].trim();
+        println("📡 Auto-detected trackpad_pressure port from /tmp: " + portToUse);
       }
     }
+
+    // 2. If no simulator file, auto-detect physical Arduino USB modem
+    if (portToUse.length() == 0) {
+      for (String p : ports) {
+        if (p.contains("tty.usbmodem") || p.contains("cu.usbmodem")) {
+          portToUse = p;
+          break;
+        }
+      }
+    }
+
+    // 3. Fallback default
+    if (portToUse.length() == 0) {
+      portToUse = "/dev/ttys031";
+    }
+
     println("Connecting to serial port: " + portToUse);
+    activePort = portToUse;
     arduino = new Serial(this, portToUse, 9600);
     arduino.bufferUntil('\n');
-    delay(500);
+    delay(200);
     arduino.clear();
+    isSerialConnected = true;
   }
   catch (Exception e) {
-    println("Serial warning (run 'python3 arduino_simulator.py'): " + e.getMessage());
+    println("Serial warning (run './trackpad_pressure'): " + e.getMessage());
   }
 
   // Start background tile download worker for Mapbox
@@ -205,6 +233,9 @@ void initRoutes() {
 void draw() {
   background(18, 22, 30);
 
+  // Auto-connect / auto-reconnect to trackpad sensor if port changed
+  checkSerialConnection();
+
   // Smoothly interpolate Zoom, Pitch (Tilt), and Route Line visibility
   currentZoom = lerp(currentZoom, targetZoom, smoothing);
   currentPitch = lerp(currentPitch, targetPitch, smoothing);
@@ -249,6 +280,9 @@ void draw() {
 
   // Telemetry Dashboard (Bottom)
   drawBottomTelemetry(currentRoute);
+
+  // Live Trackpad Pressure & Level HUD (Top-Right)
+  drawPressureHUD();
 
   // Touch notification banner
   if (touchNotificationTimer > 0) {
@@ -387,10 +421,11 @@ void tileDownloadWorker() {
       conn.setReadTimeout(3000);
 
       InputStream in = conn.getInputStream();
+      File tmpFile = new File(dataPath("tiles/" + tileKey + ".tmp"));
       File saveFile = new File(dataPath("tiles/" + tileKey + ".png"));
-      saveFile.getParentFile().mkdirs();
+      tmpFile.getParentFile().mkdirs();
 
-      FileOutputStream out = new FileOutputStream(saveFile);
+      FileOutputStream out = new FileOutputStream(tmpFile);
       byte[] buffer = new byte[4096];
       int bytesRead;
       while ((bytesRead = in.read(buffer)) != -1) {
@@ -399,10 +434,12 @@ void tileDownloadWorker() {
       out.close();
       in.close();
 
-      PImage img = loadImage("tiles/" + tileKey + ".png");
-      if (img != null && img.width > 0) {
-        synchronized (tileCache) {
-          tileCache.put(tileKey, img);
+      if (tmpFile.renameTo(saveFile)) {
+        PImage img = loadImage(saveFile.getPath());
+        if (img != null && img.width > 0) {
+          synchronized (tileCache) {
+            tileCache.put(tileKey, img);
+          }
         }
       }
     }
@@ -638,54 +675,231 @@ void drawTouchNotification() {
 }
 
 // -------------------------------------------------------------
-// Serial communication & 3-Scale Level State Machine
+// Serial communication & Zero-Lag Buffer Draining
 // -------------------------------------------------------------
 void serialEvent(Serial port) {
-  String message = port.readStringUntil('\n');
-  if (message == null) return;
-  message = trim(message);
-  if (message.length() == 0) return;
+  while (port.available() > 0) {
+    String message = port.readStringUntil('\n');
+    if (message == null) break;
+    message = trim(message);
+    if (message.length() == 0) continue;
 
-  // Capacitive touch: cycle to next bike route
-  if (message.equals("TOUCH")) {
-    println("Touch detected — switching bike route.");
-    currentRouteIdx = (currentRouteIdx + 1) % routes.length;
-    touchNotificationTimer = 60;
-    return;
-  }
+    lastSerialReceiveTime = millis();
+    isSerialConnected = true;
 
-  // Ignore startup ready message
-  if (message.equals("READY")) return;
-
-  // FSR pressure reading
-  try {
-    fsrRaw = int(message);
-
-    // ---------------------------------------------------------
-    // 3 Levels of Scale Mapping based on FSR pressure:
-    // Level 1: fsrRaw < 300   -> Deep Panned 3D View (64 deg pitch), z17.8 (ultra zoomed in), No route line, with directions
-    // Level 2: 300 <= fsrRaw < 650 -> Flat 2D View (0 deg pitch), z15.0, With route line
-    // Level 3: fsrRaw >= 650  -> Flat 2D View (0 deg pitch), z13.0, With route line (max zoomed out city overview)
-    // ---------------------------------------------------------
-    if (fsrRaw < 300) {
-      currentLevel = 1;
-      targetZoom = 17.8;           // Deep close-up street zoom
-      targetPitch = 64.0;          // Steep forward panned perspective
-      targetRouteLineAlpha = 0.0;  // No route line (clean road view)
-    } else if (fsrRaw < 650) {
-      currentLevel = 2;
-      targetZoom = 15.0;           // Zoomed out neighborhood
-      targetPitch = 0.0;           // Flat top-down
-      targetRouteLineAlpha = 1.0;  // With navigation line
-    } else {
-      currentLevel = 3;
-      targetZoom = 13.0;           // More zoomed out (City Overview)
-      targetPitch = 0.0;           // Flat top-down
-      targetRouteLineAlpha = 1.0;  // With navigation line
+    // Capacitive touch: cycle to next bike route (debounced >= 800ms)
+    if (message.equals("TOUCH")) {
+      if (millis() - lastTouchSwitchTime >= 800) {
+        lastTouchSwitchTime = millis();
+        println("⚡ Touch detected — switching bike route.");
+        currentRouteIdx = (currentRouteIdx + 1) % routes.length;
+        touchNotificationTimer = 60;
+      }
+      continue;
     }
-  }
-  catch (Exception e) {
-    // Ignore parse error
+
+    // Ignore startup ready message
+    if (message.equals("READY")) continue;
+
+    // FSR pressure reading
+    try {
+      int parsedVal = int(message);
+      updateScaleFromFSR(parsedVal);
+    }
+    catch (Exception e) {
+      // Ignore parse error
+    }
   }
 }
 
+// -------------------------------------------------------------
+// 3 Levels of Scale Mapping based on FSR pressure (0 - 1200g):
+// Level 1: fsrRaw < 80   -> Deep Panned 3D View (64 deg pitch), z17.8, No route line
+// Level 2: 80 <= fsrRaw < 400 -> Flat 2D View (0 deg pitch), z16.2 to z14.5, With route line
+// Level 3: fsrRaw >= 400 -> Flat 2D View (0 deg pitch), z14.0 to z12.5 (City Overview), With route line
+// -------------------------------------------------------------
+void updateScaleFromFSR(int val) {
+  fsrRaw = constrain(val, 0, 1200);
+
+  if (fsrRaw < 80) {
+    currentLevel = 1;
+    targetZoom = 17.8;           // Deep close-up street zoom
+    targetPitch = 64.0;          // Steep forward panned perspective
+    targetRouteLineAlpha = 0.0;  // No route line (clean road view)
+  } else if (fsrRaw < 400) {
+    currentLevel = 2;
+    targetPitch = 0.0;           // Flat top-down
+    targetRouteLineAlpha = 1.0;  // With navigation line
+    targetZoom = map(fsrRaw, 80, 400, 16.2, 14.5);
+  } else {
+    currentLevel = 3;
+    targetPitch = 0.0;           // Flat top-down
+    targetRouteLineAlpha = 1.0;  // With navigation line
+    targetZoom = map(constrain(fsrRaw, 400, 1200), 400, 1200, 14.0, 12.5);
+  }
+}
+
+// Interactive Keyboard Simulation Controls:
+// - Spacebar: Switch bike route (simulating capacitive touch)
+// - Keys '1', '2', '3': Jump directly to Level 1, 2, or 3
+// - UP / DOWN Arrows: Incrementally increase / decrease pressure
+void keyPressed() {
+  if (key == ' ') {
+    println("⚡ Spacebar: Switched route.");
+    currentRouteIdx = (currentRouteIdx + 1) % routes.length;
+    touchNotificationTimer = 60;
+  } else if (key == '1') {
+    println("⌨️ Simulated Level 1 (20g)");
+    updateScaleFromFSR(20);
+  } else if (key == '2') {
+    println("⌨️ Simulated Level 2 (200g)");
+    updateScaleFromFSR(200);
+  } else if (key == '3') {
+    println("⌨️ Simulated Level 3 (600g)");
+    updateScaleFromFSR(600);
+  } else if (keyCode == UP) {
+    updateScaleFromFSR(min(1200, fsrRaw + 50));
+    println("⌨️ Simulated Force: " + fsrRaw + "g");
+  } else if (keyCode == DOWN) {
+    updateScaleFromFSR(max(0, fsrRaw - 50));
+    println("⌨️ Simulated Force: " + fsrRaw + "g");
+  }
+}
+
+// -------------------------------------------------------------
+// Live Trackpad Pressure & Scale Level HUD
+// -------------------------------------------------------------
+void drawPressureHUD() {
+  pushMatrix();
+  float hudW = 340;
+  float hudH = 92;
+  float hudX = width - hudW - 30;
+  float hudY = 30;
+  translate(hudX, hudY);
+
+  // Rounded glassmorphic container
+  fill(16, 22, 34, 235);
+  stroke(40, 60, 85);
+  strokeWeight(1.5);
+  rect(0, 0, hudW, hudH, 16);
+
+  // Connection status dot
+  boolean connected = isSerialConnected && (millis() - lastSerialReceiveTime < 3500);
+  if (connected) {
+    fill(0, 230, 160); // Emerald green
+  } else {
+    fill(255, 170, 0); // Amber warning
+  }
+  noStroke();
+  ellipse(20, 22, 10, 10);
+
+  // Header Title
+  fill(255);
+  textAlign(LEFT, CENTER);
+  textSize(13);
+  text(connected ? "TRACKPAD FORCE SENSOR" : "WAITING FOR BRIDGE...", 34, 22);
+
+  // Port label
+  fill(130, 160, 190);
+  textAlign(RIGHT, CENTER);
+  textSize(11);
+  String shortPort = activePort;
+  if (shortPort.startsWith("/dev/")) shortPort = shortPort.substring(5);
+  text(connected ? "● " + shortPort : "OFFLINE", hudW - 18, 22);
+
+  // FSR Value or Prompt
+  fill(180, 210, 240);
+  textAlign(LEFT, CENTER);
+  textSize(12);
+  if (connected) {
+    text("Force: " + fsrRaw + " / 1200g", 18, 46);
+  } else {
+    fill(255, 200, 100);
+    text("Run ./trackpad_pressure in Terminal", 18, 46);
+  }
+
+  // Level Badge Pill
+  String lvlStr = "LEVEL 1 • 3D STREET";
+  int lvlColor = color(0, 170, 255);
+  if (currentLevel == 2) {
+    lvlStr = "LEVEL 2 • 2D ROUTE";
+    lvlColor = color(0, 230, 160);
+  } else if (currentLevel == 3) {
+    lvlStr = "LEVEL 3 • CITY OVERVIEW";
+    lvlColor = color(255, 100, 130);
+  }
+
+  fill(lvlColor, 40);
+  stroke(lvlColor, 180);
+  strokeWeight(1);
+  rect(hudW - 165, 36, 147, 20, 8);
+
+  fill(lvlColor);
+  textAlign(CENTER, CENTER);
+  textSize(9);
+  text(lvlStr, hudW - 165 + 73, 45);
+
+  // Force Meter Progress Bar
+  float barX = 18;
+  float barY = 66;
+  float barW = hudW - 36;
+  float barH = 10;
+
+  // Background trough
+  fill(25, 35, 50);
+  noStroke();
+  rect(barX, barY, barW, barH, 5);
+
+  // Dynamic filled bar
+  float fillPct = constrain(fsrRaw / 1200.0, 0.0, 1.0);
+  if (fillPct > 0.01) {
+    fill(lvlColor);
+    rect(barX, barY, barW * fillPct, barH, 5);
+  }
+
+  popMatrix();
+}
+
+// -------------------------------------------------------------
+// Auto-Reconnect to Trackpad Sensor Port
+// -------------------------------------------------------------
+void checkSerialConnection() {
+  boolean recentlyActive = isSerialConnected && (millis() - lastSerialReceiveTime < 3500);
+  if (arduino != null && recentlyActive) {
+    return;
+  }
+
+  // Throttle check to every 1.5 seconds
+  if (millis() - lastReconnectAttempt < 1500) {
+    return;
+  }
+  lastReconnectAttempt = millis();
+
+  File autoPortFile = new File("/tmp/trackpad_pressure_port.txt");
+  if (autoPortFile.exists()) {
+    String[] lines = loadStrings(autoPortFile);
+    if (lines != null && lines.length > 0 && lines[0].trim().length() > 0) {
+      String detectedPort = lines[0].trim();
+      if (!detectedPort.equals(activePort) || arduino == null || !isSerialConnected) {
+        try {
+          if (arduino != null) {
+            try { arduino.stop(); } catch (Exception ignored) {}
+            arduino = null;
+          }
+          println("🔄 Connecting to trackpad sensor on: " + detectedPort);
+          activePort = detectedPort;
+          arduino = new Serial(this, detectedPort, 9600);
+          arduino.bufferUntil('\n');
+          delay(100);
+          arduino.clear();
+          isSerialConnected = true;
+          lastSerialReceiveTime = millis();
+        } catch (Exception e) {
+          isSerialConnected = false;
+        }
+      }
+    }
+  } else {
+    isSerialConnected = false;
+  }
+}

@@ -14,7 +14,7 @@ float maxZoom = 2.5;
 
 int fsrRaw = 0;
 int fsrMin = 50;    // Adjust: value when FSR is untouched
-int fsrMax = 900;   // Adjust: value at maximum pressure
+int fsrMax = 1200;   // Adjust: value at maximum pressure
 boolean isLoading = false;
 
 void setup() {
@@ -22,8 +22,16 @@ void setup() {
 
   printArray(Serial.list());
 
-  // Replace with your Arduino port.
-  arduino = new Serial(this, "/dev/cu.usbmodem2101", 9600);
+  String portToUse = "/dev/cu.usbmodem2101";
+  File autoPortFile = new File("/tmp/trackpad_pressure_port.txt");
+  if (autoPortFile.exists()) {
+    String[] lines = loadStrings(autoPortFile);
+    if (lines != null && lines.length > 0 && lines[0].trim().length() > 0) {
+      portToUse = lines[0].trim();
+      println("📡 Auto-detected trackpad_pressure port: " + portToUse);
+    }
+  }
+  arduino = new Serial(this, portToUse, 9600);
   arduino.bufferUntil('\n');
 
   // Wait for Arduino to calibrate.
@@ -65,34 +73,30 @@ void draw() {
 }
 
 void serialEvent(Serial port) {
-  String message = port.readStringUntil('\n');
+  while (port.available() > 0) {
+    String message = port.readStringUntil('\n');
+    if (message == null) break;
+    message = trim(message);
+    if (message.length() == 0) continue;
 
-  if (message == null) return;
+    // Capacitive touch: load a new random image.
+    if (message.equals("TOUCH")) {
+      println("⚡ Touch detected — loading new image.");
+      loadHubbleImage();
+      continue;
+    }
 
-  message = trim(message);
+    // Ignore startup confirmation message.
+    if (message.equals("READY")) continue;
 
-  if (message.length() == 0) return;
-
-  // Capacitive touch: load a new random image.
-  if (message.equals("TOUCH")) {
-    println("Touch detected — loading new image.");
-    //loadRandomImage();
-    loadHubbleImage();
-    return;
-  }
-
-  // Ignore the startup confirmation message.
-  if (message.equals("READY")) return;
-
-  // FSR
-  try {
-    fsrRaw = int(message);
-
-    targetZoom = map(fsrRaw, fsrMin, fsrMax, minZoom, maxZoom);
-    targetZoom = constrain(targetZoom, minZoom, maxZoom);
-
-  } catch (Exception e) {
-    println("Parse error: " + e.getMessage());
+    // FSR
+    try {
+      fsrRaw = int(message);
+      targetZoom = map(fsrRaw, fsrMin, fsrMax, minZoom, maxZoom);
+      targetZoom = constrain(targetZoom, minZoom, maxZoom);
+    } catch (Exception e) {
+      // ignore
+    }
   }
 }
 
