@@ -48,6 +48,34 @@ int lastSerialReceiveTime = 0;
 int lastTouchSwitchTime = 0;
 int lastReconnectAttempt = 0;
 
+// -------------------------------------------------------------
+// Sticky Zoom / Pressure-Lock State Machine
+// - Hold a pressure level for 2.0s -> Sticks to that zoom level
+// - Triple tap -> Releases sticky zoom and returns to default street view (Level 1)
+// -------------------------------------------------------------
+boolean isZoomLocked = false;
+int lockedLevel = 1;
+float lockedZoom = 17.8;
+float lockedPitch = 64.0;
+float lockedRouteAlpha = 0.0;
+
+int holdLevel = 1;
+int holdStartTime = 0;
+float holdProgress = 0.0; // 0.0 to 1.0 (towards 2.0 seconds)
+int lockNotificationTimer = 0;
+String lockNotificationText = "";
+int lockNotificationColor = color(0, 230, 160);
+
+// Triple-Tap Unlock State Machine
+int tapCount = 0;
+int lastTapTime = 0;
+int lastRegisteredTapTime = 0;
+final int TAP_MAX_INTERVAL_MS = 850; // max window between consecutive taps
+
+// Pressure impulse detection for taps
+boolean fsrWasPressed = false;
+int fsrPressStartTime = 0;
+
 // GPS Coordinates (Latitude, Longitude)
 class LatLon {
   double lat, lon;
@@ -288,6 +316,12 @@ void draw() {
   if (touchNotificationTimer > 0) {
     drawTouchNotification();
     touchNotificationTimer--;
+  }
+
+  // Sticky Zoom Lock / Unlock notification banner
+  if (lockNotificationTimer > 0) {
+    drawLockNotification();
+    lockNotificationTimer--;
   }
 
   hint(ENABLE_DEPTH_TEST);
@@ -674,6 +708,74 @@ void drawTouchNotification() {
   popMatrix();
 }
 
+// Lock / Unlock notification banner
+void drawLockNotification() {
+  pushMatrix();
+  translate(width / 2 - 200, 160);
+
+  fill(16, 24, 38, 240);
+  stroke(lockNotificationColor);
+  strokeWeight(2);
+  rect(0, 0, 400, 48, 14);
+
+  fill(lockNotificationColor);
+  textAlign(CENTER, CENTER);
+  textSize(14);
+  text(lockNotificationText, 200, 23);
+
+  popMatrix();
+}
+
+// -------------------------------------------------------------
+// Tap Handler: Handles single touches and triple-tap unlock
+// -------------------------------------------------------------
+void registerTap() {
+  int now = millis();
+  // Filter out any duplicate triggers within 80ms
+  if (now - lastRegisteredTapTime < 80) return;
+  lastRegisteredTapTime = now;
+
+  if (isZoomLocked) {
+    // If consecutive tap took too long (> 850ms), reset tap counter to 1
+    if (now - lastTapTime > TAP_MAX_INTERVAL_MS) {
+      tapCount = 1;
+    } else {
+      tapCount++;
+    }
+    lastTapTime = now;
+    println("👆 Tap registered while locked: " + tapCount + "/3");
+
+    if (tapCount >= 3) {
+      // Triple tap confirmed -> Unlock sticky zoom!
+      isZoomLocked = false;
+      tapCount = 0;
+      currentLevel = 1;
+      targetZoom = 17.8;
+      targetPitch = 64.0;
+      targetRouteLineAlpha = 0.0;
+      holdProgress = 0.0;
+      holdLevel = 1;
+
+      lockNotificationText = "🔓 Triple Tap: Unlocked to Default Street View!";
+      lockNotificationColor = color(0, 170, 255);
+      lockNotificationTimer = 110;
+      println("🔓 Triple Tap confirmed: Returned to default Level 1.");
+    } else {
+      lockNotificationText = "👆 Tap " + tapCount + "/3 to Unlock";
+      lockNotificationColor = color(255, 205, 50);
+      lockNotificationTimer = 50;
+    }
+  } else {
+    // When NOT locked: single tap cycles bike route (debounced 350ms)
+    if (now - lastTouchSwitchTime >= 350) {
+      lastTouchSwitchTime = now;
+      println("⚡ Tap detected — switching bike route.");
+      currentRouteIdx = (currentRouteIdx + 1) % routes.length;
+      touchNotificationTimer = 60;
+    }
+  }
+}
+
 // -------------------------------------------------------------
 // Serial communication & Zero-Lag Buffer Draining
 // -------------------------------------------------------------
@@ -687,14 +789,9 @@ void serialEvent(Serial port) {
     lastSerialReceiveTime = millis();
     isSerialConnected = true;
 
-    // Capacitive touch: cycle to next bike route (debounced >= 800ms)
-    if (message.equals("TOUCH")) {
-      if (millis() - lastTouchSwitchTime >= 800) {
-        lastTouchSwitchTime = millis();
-        println("⚡ Touch detected — switching bike route.");
-        currentRouteIdx = (currentRouteIdx + 1) % routes.length;
-        touchNotificationTimer = 60;
-      }
+    // Capacitive touch or tap event
+    if (message.equals("TOUCH") || message.equals("TAP")) {
+      registerTap();
       continue;
     }
 
@@ -714,49 +811,145 @@ void serialEvent(Serial port) {
 
 // -------------------------------------------------------------
 // 3 Levels of Scale Mapping based on FSR pressure (0 - 1200g):
-// Level 1: fsrRaw < 80   -> Deep Panned 3D View (64 deg pitch), z17.8, No route line
-// Level 2: 80 <= fsrRaw < 400 -> Flat 2D View (0 deg pitch), z16.2 to z14.5, With route line
-// Level 3: fsrRaw >= 400 -> Flat 2D View (0 deg pitch), z14.0 to z12.5 (City Overview), With route line
+// - Level 1: fsrRaw < 80   -> Deep Panned 3D View (64 deg pitch), z17.8, No route line (Default)
+// - Level 2: 80 <= fsrRaw < 400 -> Flat 2D View (0 deg pitch), z16.2 to z14.5, With route line
+// - Level 3: fsrRaw >= 400 -> Flat 2D View (0 deg pitch), z14.0 to z12.5 (City Overview), With route line
+//
+// Sticky Zoom Logic:
+// - Hold Level 2 or 3 steadily for 2.0s -> Sticks/Locks to that zoom level
+// - Triple tap -> Returns to default Level 1
 // -------------------------------------------------------------
 void updateScaleFromFSR(int val) {
   fsrRaw = constrain(val, 0, 1200);
 
+  // Pressure impulse tap detection (quick tap < 350ms)
+  if (fsrRaw >= 50 && !fsrWasPressed) {
+    fsrWasPressed = true;
+    fsrPressStartTime = millis();
+  } else if (fsrRaw < 25 && fsrWasPressed) {
+    fsrWasPressed = false;
+    int pressDuration = millis() - fsrPressStartTime;
+    if (pressDuration < 380) {
+      registerTap();
+    }
+  }
+
+  // Auto-reset tapCount if user paused longer than TAP_MAX_INTERVAL_MS
+  if (isZoomLocked && tapCount > 0 && (millis() - lastTapTime > TAP_MAX_INTERVAL_MS)) {
+    tapCount = 0;
+  }
+
+  // 1. Determine instantaneous target level from physical pressure
+  int instantLevel = 1;
+  float instantZoom = 17.8;
+  float instantPitch = 64.0;
+  float instantRouteAlpha = 0.0;
+
   if (fsrRaw < 80) {
-    currentLevel = 1;
-    targetZoom = 17.8;           // Deep close-up street zoom
-    targetPitch = 64.0;          // Steep forward panned perspective
-    targetRouteLineAlpha = 0.0;  // No route line (clean road view)
+    instantLevel = 1;
+    instantZoom = 17.8;           // Deep close-up street zoom
+    instantPitch = 64.0;          // Steep forward panned perspective
+    instantRouteAlpha = 0.0;      // No route line (clean road view)
   } else if (fsrRaw < 400) {
-    currentLevel = 2;
-    targetPitch = 0.0;           // Flat top-down
-    targetRouteLineAlpha = 1.0;  // With navigation line
-    targetZoom = map(fsrRaw, 80, 400, 16.2, 14.5);
+    instantLevel = 2;
+    instantPitch = 0.0;           // Flat top-down
+    instantRouteAlpha = 1.0;      // With navigation line
+    instantZoom = map(fsrRaw, 80, 400, 16.2, 14.5);
   } else {
-    currentLevel = 3;
-    targetPitch = 0.0;           // Flat top-down
-    targetRouteLineAlpha = 1.0;  // With navigation line
-    targetZoom = map(constrain(fsrRaw, 400, 1200), 400, 1200, 14.0, 12.5);
+    instantLevel = 3;
+    instantPitch = 0.0;           // Flat top-down
+    instantRouteAlpha = 1.0;      // With navigation line
+    instantZoom = map(constrain(fsrRaw, 400, 1200), 400, 1200, 14.0, 12.5);
+  }
+
+  // 2. Handling LOCK (holding pressure level for 2.0 seconds):
+  if (instantLevel >= 2) {
+    if (instantLevel == holdLevel) {
+      int elapsed = millis() - holdStartTime;
+      holdProgress = constrain(elapsed / 2000.0, 0.0, 1.0);
+
+      if (elapsed >= 2000 && (!isZoomLocked || lockedLevel != instantLevel)) {
+        // Sticky Lock Engaged!
+        isZoomLocked = true;
+        lockedLevel = instantLevel;
+        lockedZoom = instantZoom;
+        lockedPitch = instantPitch;
+        lockedRouteAlpha = instantRouteAlpha;
+        holdProgress = 0.0;
+        tapCount = 0;
+
+        lockNotificationText = "🔒 Held 2s: Sticky Zoom Locked to Level " + lockedLevel + "!";
+        lockNotificationColor = (lockedLevel == 2) ? color(0, 230, 160) : color(255, 100, 130);
+        lockNotificationTimer = 120;
+        println("🔒 Level " + lockedLevel + " sticky zoom locked!");
+      }
+    } else {
+      holdLevel = instantLevel;
+      holdStartTime = millis();
+      holdProgress = 0.0;
+    }
+  } else {
+    // Finger lifted / resting: reset hold progress
+    holdLevel = 1;
+    holdStartTime = millis();
+    holdProgress = 0.0;
+  }
+
+  // 3. Update current target variables (if locked and finger lifted, remain locked)
+  if (isZoomLocked && fsrRaw < 80) {
+    currentLevel = lockedLevel;
+    targetZoom = lockedZoom;
+    targetPitch = lockedPitch;
+    targetRouteLineAlpha = lockedRouteAlpha;
+  } else {
+    currentLevel = instantLevel;
+    targetZoom = instantZoom;
+    targetPitch = instantPitch;
+    targetRouteLineAlpha = instantRouteAlpha;
   }
 }
 
-// Interactive Keyboard Simulation Controls:
-// - Spacebar: Switch bike route (simulating capacitive touch)
-// - Keys '1', '2', '3': Jump directly to Level 1, 2, or 3
+// Interactive Keyboard & Mouse Simulation Controls:
+// - Click / Spacebar / 'T': Register tap (triple tap unlocks)
+// - Keys '1', 'U': Direct unlock to default Level 1
+// - Keys '2', '3': Jump directly to Level 2 or 3
 // - UP / DOWN Arrows: Incrementally increase / decrease pressure
 void keyPressed() {
   if (key == ' ') {
-    println("⚡ Spacebar: Switched route.");
-    currentRouteIdx = (currentRouteIdx + 1) % routes.length;
-    touchNotificationTimer = 60;
-  } else if (key == '1') {
-    println("⌨️ Simulated Level 1 (20g)");
-    updateScaleFromFSR(20);
+    registerTap();
+  } else if (key == 't' || key == 'T') {
+    println("⌨️ Key 'T' pressed: Registering tap");
+    registerTap();
+  } else if (key == '1' || key == 'u' || key == 'U') {
+    println("⌨️ Unlock shortcut: Returned to default Level 1");
+    isZoomLocked = false;
+    tapCount = 0;
+    updateScaleFromFSR(0);
+    lockNotificationText = "🔓 Unlocked: Returned to Default Street View";
+    lockNotificationColor = color(0, 170, 255);
+    lockNotificationTimer = 90;
   } else if (key == '2') {
-    println("⌨️ Simulated Level 2 (200g)");
+    println("⌨️ Simulated Level 2 (200g) - Locking");
+    isZoomLocked = true;
+    lockedLevel = 2;
     updateScaleFromFSR(200);
+    lockedZoom = targetZoom;
+    lockedPitch = targetPitch;
+    lockedRouteAlpha = targetRouteLineAlpha;
+    lockNotificationText = "🔒 Sticky Zoom Locked to Level 2";
+    lockNotificationColor = color(0, 230, 160);
+    lockNotificationTimer = 90;
   } else if (key == '3') {
-    println("⌨️ Simulated Level 3 (600g)");
+    println("⌨️ Simulated Level 3 (600g) - Locking");
+    isZoomLocked = true;
+    lockedLevel = 3;
     updateScaleFromFSR(600);
+    lockedZoom = targetZoom;
+    lockedPitch = targetPitch;
+    lockedRouteAlpha = targetRouteLineAlpha;
+    lockNotificationText = "🔒 Sticky Zoom Locked to Level 3";
+    lockNotificationColor = color(255, 100, 130);
+    lockNotificationTimer = 90;
   } else if (keyCode == UP) {
     updateScaleFromFSR(min(1200, fsrRaw + 50));
     println("⌨️ Simulated Force: " + fsrRaw + "g");
@@ -766,21 +959,25 @@ void keyPressed() {
   }
 }
 
+void mousePressed() {
+  registerTap();
+}
+
 // -------------------------------------------------------------
 // Live Trackpad Pressure & Scale Level HUD
 // -------------------------------------------------------------
 void drawPressureHUD() {
   pushMatrix();
-  float hudW = 340;
-  float hudH = 92;
+  float hudW = 350;
+  float hudH = 114;
   float hudX = width - hudW - 30;
   float hudY = 30;
   translate(hudX, hudY);
 
   // Rounded glassmorphic container
   fill(16, 22, 34, 235);
-  stroke(40, 60, 85);
-  strokeWeight(1.5);
+  stroke(isZoomLocked ? color(0, 230, 160) : color(40, 60, 85));
+  strokeWeight(isZoomLocked ? 2 : 1.5);
   rect(0, 0, hudW, hudH, 16);
 
   // Connection status dot
@@ -822,22 +1019,22 @@ void drawPressureHUD() {
   String lvlStr = "LEVEL 1 • 3D STREET";
   int lvlColor = color(0, 170, 255);
   if (currentLevel == 2) {
-    lvlStr = "LEVEL 2 • 2D ROUTE";
+    lvlStr = isZoomLocked ? "🔒 LOCKED: LEVEL 2" : "LEVEL 2 • 2D ROUTE";
     lvlColor = color(0, 230, 160);
   } else if (currentLevel == 3) {
-    lvlStr = "LEVEL 3 • CITY OVERVIEW";
+    lvlStr = isZoomLocked ? "🔒 LOCKED: LEVEL 3" : "LEVEL 3 • CITY OVERVIEW";
     lvlColor = color(255, 100, 130);
   }
 
   fill(lvlColor, 40);
   stroke(lvlColor, 180);
   strokeWeight(1);
-  rect(hudW - 165, 36, 147, 20, 8);
+  rect(hudW - 175, 36, 157, 20, 8);
 
   fill(lvlColor);
   textAlign(CENTER, CENTER);
   textSize(9);
-  text(lvlStr, hudW - 165 + 73, 45);
+  text(lvlStr, hudW - 175 + 78, 45);
 
   // Force Meter Progress Bar
   float barX = 18;
@@ -855,6 +1052,30 @@ void drawPressureHUD() {
   if (fillPct > 0.01) {
     fill(lvlColor);
     rect(barX, barY, barW * fillPct, barH, 5);
+  }
+
+  // Bottom Status / Lock Instruction Line
+  textAlign(LEFT, CENTER);
+  textSize(10);
+  if (isZoomLocked) {
+    if (tapCount > 0) {
+      fill(255, 205, 50);
+      text("👆 Tap " + tapCount + "/3 • Tap " + (3 - tapCount) + " more times to unlock", 18, 93);
+    } else {
+      fill(0, 230, 160);
+      text("🔒 STICKY ZOOM ON • Triple-tap to return to default view", 18, 93);
+    }
+  } else if (holdProgress > 0.02) {
+    fill(255, 200, 80);
+    text("Hold 2s to Lock: " + int(holdProgress * 100) + "%", 18, 93);
+    noStroke();
+    fill(255, 200, 80, 80);
+    rect(160, 88, 160, 10, 4);
+    fill(255, 200, 80);
+    rect(160, 88, 160 * holdProgress, 10, 4);
+  } else {
+    fill(120, 145, 175);
+    text("Hold pressure 2s to lock • Triple-tap to reset", 18, 93);
   }
 
   popMatrix();

@@ -50,8 +50,8 @@ final class BridgeState {
         if count > 0 {
             if !hadTouches {
                 hadTouches = true
-                // Debounce touch trigger: only trigger if fingers were lifted for >= 350ms
-                if (now - lastLiftTime) >= 0.35 && (now - lastTouchTriggerTime) >= 0.8 {
+                // Debounce touch trigger: allow crisp taps with >= 40ms lift and >= 60ms interval
+                if (now - lastLiftTime) >= 0.04 && (now - lastTouchTriggerTime) >= 0.06 {
                     touchTriggered = true
                     lastTouchTriggerTime = now
                 }
