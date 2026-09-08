@@ -29,3 +29,4 @@ application.windows64/
 **/.DS_Store
 Literature/
 temp/
+**/temp/
