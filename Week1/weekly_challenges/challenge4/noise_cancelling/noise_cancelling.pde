@@ -11,7 +11,7 @@
 //     1. Glowing acoustic shield expands, strengthens, and deflects incoming sound particles.
 //     2. Real-time procedural audio attenuates ambient rumble & noise down to silence.
 //     3. Noise reduction increases smoothly from 0 dB to -45 dB SPL.
-// - Tap Trackpad (or press 'T' / Space): Cycles between 3 realistic soundscapes:
+// - Spacebar (or 'T'): Cycles between 3 realistic soundscapes:
 //     * Airplane Cabin (Twin-turbofan low rumble + air hiss)
 //     * Metro / Subway Train (Steel rails + motor drone)
 //     * Rainy City Street (Rainfall hiss + distant traffic)
@@ -597,7 +597,7 @@ void drawTopNavigationBar() {
 
   fill(130, 155, 185);
   textSize(11);
-  text(sc.subtitle + " • Tap trackpad to switch", 44.0f, 29.0f);
+  text(sc.subtitle + " • Press Space to switch", 44.0f, 29.0f);
 
   popMatrix();
 
@@ -763,7 +763,7 @@ void drawBottomHelpBar() {
   text("💡 CONTROLS: Press harder on Force Touch Trackpad to cancel noise • Hold 2s for Sticky Lock • Triple-tap trackpad to unlock", 40.0f, height - 19.0f);
 
   textAlign(RIGHT, CENTER);
-  text("Keys: [UP/DOWN] Simulate Force • [1-4] Jump Tier • [U] Unlock • [T/Space] Soundscape • [M] Mute", (float)width - 40.0f, height - 19.0f);
+  text("Keys: [UP/DOWN] Simulate Force • [1-4] Jump Tier • [U] Unlock • [Space] Soundscape • [M] Mute", (float)width - 40.0f, height - 19.0f);
 }
 
 // =============================================================
@@ -888,6 +888,22 @@ void updateANCFromFSR(int val) {
 }
 
 // -------------------------------------------------------------
+// Soundscape Switching
+// -------------------------------------------------------------
+void nextSoundscape() {
+  int now = millis();
+  if (now - lastSoundscapeSwitchTime >= 250) {
+    lastSoundscapeSwitchTime = now;
+    currentSoundscapeIdx = (currentSoundscapeIdx + 1) % soundscapes.length;
+    Soundscape sc = soundscapes[currentSoundscapeIdx];
+    lockNotificationText = "🎧 Soundscape Changed: " + sc.name;
+    lockNotificationColor = sc.accentColor;
+    lockNotificationTimer = 90;
+    println("🎧 Switched to soundscape: " + sc.name);
+  }
+}
+
+// -------------------------------------------------------------
 // Tap Registration & Multimodal Switching
 // -------------------------------------------------------------
 void registerTap() {
@@ -913,17 +929,6 @@ void registerTap() {
       return;
     }
   }
-
-  // Normal tap: Cycle to next soundscape environment
-  if (now - lastSoundscapeSwitchTime >= 350) {
-    lastSoundscapeSwitchTime = now;
-    currentSoundscapeIdx = (currentSoundscapeIdx + 1) % soundscapes.length;
-    Soundscape sc = soundscapes[currentSoundscapeIdx];
-    lockNotificationText = "🎧 Soundscape Changed: " + sc.name;
-    lockNotificationColor = sc.accentColor;
-    lockNotificationTimer = 90;
-    println("🎧 Switched to soundscape: " + sc.name);
-  }
 }
 
 // -------------------------------------------------------------
@@ -931,9 +936,9 @@ void registerTap() {
 // -------------------------------------------------------------
 void keyPressed() {
   if (key == ' ') {
-    registerTap();
+    nextSoundscape();
   } else if (key == 't' || key == 'T') {
-    registerTap();
+    nextSoundscape();
   } else if (key == 'm' || key == 'M') {
     audioEnabled = !audioEnabled;
     println("🔊 Audio Output: " + (audioEnabled ? "ON" : "MUTED"));
