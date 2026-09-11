@@ -27,7 +27,7 @@ void setup() {
   printArray(Serial.list());
 
   // Replace with your Arduino port.
-  arduino = new Serial(this, "/dev/cu.usbmodem11301", 9600);
+  arduino = new Serial(this, "/dev/cu.usbmodem2101", 9600);
   arduino.bufferUntil('\n');
 
   delay(2000);
@@ -87,7 +87,7 @@ void draw() {
 
   // Check if img2 is near dead centre.
   boolean isCentered = abs(easedX - width/2) < threshold &&
-                       abs(easedY - height/2) < threshold;
+    abs(easedY - height/2) < threshold;
 
   // Only send to Arduino when the state changes.
   if (isCentered && !matched) {
