@@ -30,3 +30,6 @@ application.windows64/
 Literature/
 temp/
 **/temp/
+**/venv/
+venv/
+/venv/
