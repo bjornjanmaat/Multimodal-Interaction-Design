@@ -45,7 +45,6 @@ int fsrMax = 1200;
 String activePort = "None";
 boolean isSerialConnected = false;
 int lastSerialReceiveTime = 0;
-int lastTouchSwitchTime = 0;
 int lastReconnectAttempt = 0;
 
 // -------------------------------------------------------------
@@ -117,7 +116,6 @@ class RouteData {
 RouteData[] routes;
 int currentRouteIdx = 0;
 float pulseAngle = 0;
-int touchNotificationTimer = 0;
 
 void setup() {
   size(1280, 720, P3D);
@@ -311,12 +309,6 @@ void draw() {
 
   // Live Trackpad Pressure & Level HUD (Top-Right)
   drawPressureHUD();
-
-  // Touch notification banner
-  if (touchNotificationTimer > 0) {
-    drawTouchNotification();
-    touchNotificationTimer--;
-  }
 
   // Sticky Zoom Lock / Unlock notification banner
   if (lockNotificationTimer > 0) {
@@ -684,26 +676,7 @@ void drawBottomTelemetry(RouteData r) {
   text("📍 " + r.destination, width - 120, 26);
   fill(100, 200, 255);
   textSize(12);
-  text("Touch sensor to cycle routes", width - 120, 46);
-
-  popMatrix();
-}
-
-
-// Touch notification banner
-void drawTouchNotification() {
-  pushMatrix();
-  translate(width / 2 - 180, 160);
-
-  fill(0, 170, 255, 235);
-  stroke(255);
-  strokeWeight(1.5);
-  rect(0, 0, 360, 45, 12);
-
-  fill(255);
-  textAlign(CENTER, CENTER);
-  textSize(14);
-  text("⚡ Touch Detected: Switched Route!", 180, 22);
+  text(r.name, width - 120, 46);
 
   popMatrix();
 }
@@ -764,14 +737,6 @@ void registerTap() {
       lockNotificationText = "👆 Tap " + tapCount + "/3 to Unlock";
       lockNotificationColor = color(255, 205, 50);
       lockNotificationTimer = 50;
-    }
-  } else {
-    // When NOT locked: single tap cycles bike route (debounced 350ms)
-    if (now - lastTouchSwitchTime >= 350) {
-      lastTouchSwitchTime = now;
-      println("⚡ Tap detected — switching bike route.");
-      currentRouteIdx = (currentRouteIdx + 1) % routes.length;
-      touchNotificationTimer = 60;
     }
   }
 }
@@ -956,6 +921,9 @@ void keyPressed() {
   } else if (keyCode == DOWN) {
     updateScaleFromFSR(max(0, fsrRaw - 50));
     println("⌨️ Simulated Force: " + fsrRaw + "g");
+  } else if (key == 'r' || key == 'R') {
+    currentRouteIdx = (currentRouteIdx + 1) % routes.length;
+    println("⌨️ Switched route to: " + routes[currentRouteIdx].name);
   }
 }
 
