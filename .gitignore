@@ -33,3 +33,6 @@ temp/
 **/venv/
 venv/
 /venv/
+**/myenv/
+myenv/
+/myenv/
