@@ -7,6 +7,7 @@ calculates the average score (1-5), and sends the result to Arduino
 to light up LEDs (Pins 2-6) and trigger the Piezo Buzzer (Pin 13) gradually.
 """
 
+
 import os
 import sys
 import time
