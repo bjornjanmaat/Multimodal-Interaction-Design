@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Supabase to Arduino LED & Buzzer Bridge (Switch-Triggered)
-Listens for switch toggle signals from Arduino (Pin 12).
-When toggled ON ("FETCH"), queries Supabase public.ratings,
-calculates the average score (1-5), and sends the result to Arduino
-to light up LEDs (Pins 2-6) and trigger the Piezo Buzzer (Pin 13) gradually.
+Supabase to Arduino Auto-Polling Monitor
+- Automatically polls Supabase public.ratings every 1.5s
+- Sends signals to Arduino to control LEDs (pins 2, 3, 4, 5, 6):
+    - LEDs always display the current rounded average rating (1 to 5)
+- Sounds (Piezo buzzer on Pin 13):
+    - Every time a new vote is added -> high beep ("NEW_VOTE")
+    - If rounded average increases -> high-pitch alert ("AVG_UP")
+    - If rounded average decreases -> low-pitch alert ("AVG_DOWN")
 """
 
 import os
@@ -99,7 +102,7 @@ def try_connect_arduino(explicit_port=None, baud=9600):
             continue
         try:
             ser = serial.Serial(p, baud, timeout=0.1)
-            time.sleep(2)  # Wait for Arduino bootloader reset
+            time.sleep(2)  # Wait for Arduino reset
             print(f" Connected to Arduino on {p}")
             return ser, p
         except (serial.SerialException, OSError):
@@ -108,94 +111,126 @@ def try_connect_arduino(explicit_port=None, baud=9600):
     return None, None
 
 
+def send_to_arduino(arduino, command):
+    """Send text command line to Arduino with error handling."""
+    if arduino and arduino.is_open:
+        try:
+            arduino.write(f"{command}\n".encode())
+            arduino.flush()
+            time.sleep(0.05)
+            return True
+        except (serial.SerialException, OSError) as e:
+            print(f"❌ Serial write error: {e}")
+            return False
+    return False
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Switch-triggered Supabase ratings to Arduino LEDs & Buzzer.")
+    parser = argparse.ArgumentParser(description="Auto-fetch Supabase ratings with dynamic sound and LED triggers.")
     parser.add_argument("--port", type=str, default=None, help="Serial port for Arduino (e.g. /dev/cu.usbmodem1101)")
     parser.add_argument("--baud", type=int, default=9600, help="Baud rate (default: 9600)")
+    parser.add_argument("--interval", type=float, default=1.5, help="Poll interval in seconds (default: 1.5s)")
     args = parser.parse_args()
 
     explicit_port = args.port
     baud = args.baud
+    interval = args.interval
 
     url, key = get_supabase_credentials()
 
     print("=" * 65)
-    print("🌟 Supabase → Arduino LED & Buzzer Bridge (Pin 12 Switch Trigger)")
+    print("🌟 Supabase Auto-Polling Rating Monitor")
     print(f"📡 Supabase URL: {url}")
-    print(f"💡 LEDs: Pins 2, 3, 4, 5, 6 (Gradual activation)")
-    print(f"🔊 Buzzer: Pin 13 (Ascending pitches C5, E5, G5, A5, C6)")
-    print(f"🔘 Switch: Pin 12 (Flip switch ON to fetch and show ratings)")
+    print(f"💡 LEDs: Pins 2, 3, 4, 5, 6 (displays rounded average 1-5)")
+    print(f"🔊 Buzzer: Pin 13")
+    print(f"   • High beep on every new vote")
+    print(f"   • High pitch alert if rounded average goes UP")
+    print(f"   • Low pitch alert if rounded average goes DOWN")
+    print(f"⏱️  Auto-Poll Interval: {interval}s")
     print("=" * 65)
 
     arduino = None
     connected_port = None
 
+    last_total = None
+    last_rounded_avg = None
+
     try:
         while True:
-            # Connect or Reconnect if serial is closed
+            # 1. Ensure Arduino is connected
             if arduino is None or not arduino.is_open:
                 arduino, connected_port = try_connect_arduino(explicit_port, baud)
                 if arduino is None:
                     print("⏳ Waiting for Arduino USB connection...", end="\r", flush=True)
-                    time.sleep(1.5)
+                    time.sleep(0.1)
                     continue
                 else:
-                    print(f"\n Listening for switch toggles on {connected_port}...")
+                    print(f"\n Active connection on {connected_port}. Monitoring Supabase...")
+                    # Resend current level if known
+                    if last_rounded_avg is not None:
+                        send_to_arduino(arduino, f"LEVEL:{last_rounded_avg}")
 
-            # Read serial messages sent by the Arduino
-            try:
-                line = arduino.readline().decode(errors="ignore").strip()
-            except (serial.SerialException, OSError) as err:
-                print(f"\n❌ Serial connection dropped ({err}). Reconnecting...")
-                if arduino:
-                    try:
-                        arduino.close()
-                    except Exception:
-                        pass
-                arduino = None
-                time.sleep(1.5)
-                continue
+            # 2. Fetch latest scores from Supabase
+            total, avg = fetch_ratings_and_average(url, key)
 
-            if not line:
-                time.sleep(0.05)
-                continue
+            if total is not None:
+                rounded_avg = max(0, min(5, round(avg))) if total > 0 else 0
 
-            # Arduino reports bootloader ready
-            if line == "READY":
-                print(" Arduino reported READY. Waiting for Pin 12 switch...")
-
-            # Arduino switch toggled ON -> trigger fetch
-            elif line.upper() in ["FETCH", "TRIGGER", "ON"]:
-                print("\n🔘 [Pin 12 Switch: ON] Fetching ratings from Supabase...")
-                total, avg = fetch_ratings_and_average(url, key)
-
-                if total is not None:
-                    level = max(0, min(5, round(avg))) if total > 0 else 0
-                    active_pins = [f"Pin {p}" for p in range(2, 2 + level)]
+                # Initial fetch
+                if last_total is None:
+                    last_total = total
+                    last_rounded_avg = rounded_avg
+                    send_to_arduino(arduino, f"LEVEL:{rounded_avg}")
+                    active_pins = [f"Pin {p}" for p in range(2, 2 + rounded_avg)]
                     pins_str = ", ".join(active_pins) if active_pins else "None"
+                    print(f" Initial State: {total} votes | Average: {avg:.2f}/5.00 → LEDs: Level {rounded_avg}/5 ({pins_str})")
 
-                    print(f"📊 Total Ratings: {total} | Average: {avg:.2f}/5.00")
-                    print(f"✨ Sending Level {level}/5 to Arduino (Gradual LEDs: {pins_str} + Buzzer pitches)")
+                else:
+                    # Check if new votes arrived
+                    if total > last_total:
+                        diff = total - last_total
+                        print(f"\n🗳️  [NEW VOTE] +{diff} new vote(s) received! (Total: {total})")
+                        # Send count so Arduino beeps once per new vote
+                        send_to_arduino(arduino, f"NEW_VOTE:{diff}")
+                        # Allow time for beeps to complete (160ms tone + 90ms gap = ~250ms each)
+                        time.sleep(diff * 0.26)
 
-                    try:
-                        arduino.write(f"{level}\n".encode())
-                        arduino.flush()
-                    except (serial.SerialException, OSError) as write_err:
-                        print(f"❌ Failed to send to Arduino: {write_err}")
+                    # Check if rounded average changed
+                    if rounded_avg > last_rounded_avg:
+                        print(f"📈 [AVERAGE UP] Level went up: {last_rounded_avg} → {rounded_avg} (Exact average: {avg:.2f}/5.00)")
+                        send_to_arduino(arduino, "AVG_UP")
+                        time.sleep(0.2)
+                        send_to_arduino(arduino, f"LEVEL:{rounded_avg}")
 
-            # Arduino switch toggled OFF
-            elif line.upper() == "OFF":
-                print("🔘 [Pin 12 Switch: OFF] LEDs turned OFF & Buzzer silenced")
+                    elif rounded_avg < last_rounded_avg:
+                        print(f"📉 [AVERAGE DOWN] Level went down: {last_rounded_avg} → {rounded_avg} (Exact average: {avg:.2f}/5.00)")
+                        send_to_arduino(arduino, "AVG_DOWN")
+                        time.sleep(0.2)
+                        send_to_arduino(arduino, f"LEVEL:{rounded_avg}")
 
-            else:
-                print(f"   [Arduino] {line}")
+                    elif total > last_total:
+                        # Average remained the same, but still refresh LED level just in case
+                        send_to_arduino(arduino, f"LEVEL:{rounded_avg}")
+
+                    last_total = total
+                    last_rounded_avg = rounded_avg
+
+            # Read any serial responses from Arduino (non-blocking)
+            try:
+                if arduino and arduino.in_waiting > 0:
+                    msg = arduino.readline().decode(errors="ignore").strip()
+                    if msg:
+                        print(f"   [Arduino] {msg}")
+            except (serial.SerialException, OSError):
+                arduino = None
+
+            time.sleep(interval)
 
     except KeyboardInterrupt:
-        print("\n👋 Bridge stopped by user.")
+        print("\n👋 Monitor stopped by user.")
     finally:
         if arduino and arduino.is_open:
             try:
-                arduino.write(b"0\n")
                 arduino.close()
             except Exception:
                 pass

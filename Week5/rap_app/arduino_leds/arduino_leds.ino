@@ -1,141 +1,145 @@
 /*
- * Arduino 5-LED & Piezo Buzzer Rating Display (Switch-Triggered)
+ * Arduino 5-LED & Piezo Buzzer Live Rating Monitor
  * 
- * Hardware Connections:
- * - LEDs: Pins 2, 3, 4, 5, 6 (with resistors to GND)
- * - Switch: Pin 12 to GND (uses internal INPUT_PULLUP)
- * - Piezo Buzzer: Pin 13 to GND
+ * Hardware:
+ * - LEDs: 
+ *     Light 1 -> Pin 2 (through 220Ω resistor to GND)
+ *     Light 2 -> Pin 3 (through 220Ω resistor to GND)
+ *     Light 3 -> Pin 4 (through 220Ω resistor to GND)
+ *     Light 4 -> Pin 5 (through 220Ω resistor to GND)
+ *     Light 5 -> Pin 6 (through 220Ω resistor to GND)
+ * - Buzzer: Pin 13 (positive leg to Pin 13, negative leg to GND)
+ *   (Tip: If Pin 13 is too quiet due to the onboard LED, you can move it to Pin 11)
  * 
  * Behavior:
- * 1. Flip switch ON (Pin 12 -> LOW) -> sends "FETCH" to Python over Serial.
- * 2. Python gets average score from Supabase and sends score back (e.g. "4\n").
- * 3. Arduino triggers LEDs gradually one-by-one, playing an ascending pitch
- *    on the Pin 13 buzzer for each step (C5, E5, G5, A5, C6).
- * 4. Flip switch OFF -> LEDs sweep off and buzzer silences.
+ * 1. Startup Diagnostic: Lights up each LED 1-by-1 (Pins 2 to 6) and beeps buzzer
+ *    so you can instantly verify all 5 LEDs and the buzzer are working.
+ * 2. Real-time LED Level: LEDs (Pins 2 to 6) stay ON showing the rounded average rating.
+ * 3. New Vote: Plays a high beep when a new vote arrives.
+ * 4. Average UP: Plays a high-pitch ascending alert.
+ * 5. Average DOWN: Plays a low-pitch descending alert.
  */
 
 const int LED_PINS[] = {2, 3, 4, 5, 6};
 const int NUM_LEDS = 5;
-const int SWITCH_PIN = 12;
+
+// Change to 11 if Pin 13 onboard LED interferes with buzzer volume
 const int BUZZER_PIN = 13;
 
-// Ascending musical pitches for ratings 1 through 5 (C5, E5, G5, A5, C6)
-const int PITCHES[] = {523, 659, 784, 880, 1046};
+int currentLevel = 0;
 
-// LOW when switch connects Pin 12 to GND (INPUT_PULLUP)
-const int SWITCH_ACTIVE_STATE = LOW;
+void setLeds(int count) {
+  if (count < 0) count = 0;
+  if (count > NUM_LEDS) count = NUM_LEDS;
+  currentLevel = count;
 
-int lastReading = HIGH;
-int currentSwitchState = HIGH;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 50;
+  for (int i = 0; i < NUM_LEDS; i++) {
+    if (i < count) {
+      digitalWrite(LED_PINS[i], HIGH);
+    } else {
+      digitalWrite(LED_PINS[i], LOW);
+    }
+  }
+}
+
+// Sound generator (compatible with both passive and active buzzers)
+void beep(int freq, int durationMs) {
+  tone(BUZZER_PIN, freq, durationMs);
+  // Fallback for active buzzers that require DC HIGH
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(durationMs);
+  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// 1. High beep when new vote(s) are submitted (beeps 'count' times)
+void playNewVoteBeep(int count = 1) {
+  if (count < 1) count = 1;
+  for (int i = 0; i < count; i++) {
+    beep(1200, 160);
+    if (i < count - 1) {
+      delay(90); // Short pause between consecutive beeps
+    }
+  }
+}
+
+// 2. High-pitch chime when average goes UP
+void playAvgUpBeep() {
+  beep(1400, 110);
+  delay(50);
+  beep(1850, 160);
+}
+
+// 3. Low-pitch chime when average goes DOWN
+void playAvgDownBeep() {
+  beep(400, 140);
+  delay(50);
+  beep(250, 200);
+}
 
 void setup() {
   Serial.begin(9600);
 
-  // Initialize LED pins
+  // Initialize LED pins as OUTPUT
   for (int i = 0; i < NUM_LEDS; i++) {
     pinMode(LED_PINS[i], OUTPUT);
     digitalWrite(LED_PINS[i], LOW);
   }
 
-  // Initialize Buzzer
+  // Initialize Buzzer pin as OUTPUT
   pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
   noTone(BUZZER_PIN);
 
-  // Initialize Pin 12 switch with internal pullup
-  pinMode(SWITCH_PIN, INPUT_PULLUP);
-  lastReading = digitalRead(SWITCH_PIN);
-  currentSwitchState = lastReading;
-
-  // Startup quick chime & light test
+  // -------------------------------------------------------------
+  // STARTUP SELF-TEST DIAGNOSTIC:
+  // Tests each LED sequentially so you can see if all 5 are wired correctly!
+  // -------------------------------------------------------------
   for (int i = 0; i < NUM_LEDS; i++) {
     digitalWrite(LED_PINS[i], HIGH);
-    tone(BUZZER_PIN, PITCHES[i], 60);
-    delay(80);
+    beep(800 + (i * 250), 100);
+    delay(150);
     digitalWrite(LED_PINS[i], LOW);
+    delay(50);
   }
-  noTone(BUZZER_PIN);
+
+  // Flash all 5 LEDs together once
+  setLeds(5);
+  delay(200);
+  setLeds(0);
 
   Serial.println("READY");
 }
 
-// Gradually trigger LEDs and buzzer pitches up to targetCount
-void showRatingGradually(int targetCount) {
-  if (targetCount < 0) targetCount = 0;
-  if (targetCount > NUM_LEDS) targetCount = NUM_LEDS;
-
-  // First turn off any existing LEDs
-  for (int i = 0; i < NUM_LEDS; i++) {
-    digitalWrite(LED_PINS[i], LOW);
-  }
-  noTone(BUZZER_PIN);
-  delay(100);
-
-  if (targetCount == 0) {
-    // Low tone indicating zero / no ratings
-    tone(BUZZER_PIN, 220, 150);
-    delay(150);
-    noTone(BUZZER_PIN);
-    return;
-  }
-
-  // Light LEDs gradually one by one with ascending pitch
-  for (int i = 0; i < targetCount; i++) {
-    digitalWrite(LED_PINS[i], HIGH);
-    tone(BUZZER_PIN, PITCHES[i], 120); // 120ms pitch
-    delay(160); // 160ms step timing for gradual build-up
-  }
-
-  noTone(BUZZER_PIN);
-}
-
-// Turn off LEDs in a quick reverse cascade
-void turnOffLeds() {
-  noTone(BUZZER_PIN);
-  for (int i = NUM_LEDS - 1; i >= 0; i--) {
-    digitalWrite(LED_PINS[i], LOW);
-    delay(35);
-  }
-}
-
 void loop() {
-  // 1. Read switch on Pin 12 with debounce
-  int reading = digitalRead(SWITCH_PIN);
-
-  if (reading != lastReading) {
-    lastDebounceTime = millis();
-  }
-
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading != currentSwitchState) {
-      currentSwitchState = reading;
-
-      if (currentSwitchState == SWITCH_ACTIVE_STATE) {
-        // Switch toggled ON: request score from Python
-        Serial.println("FETCH");
-      } else {
-        // Switch toggled OFF: turn off display
-        turnOffLeds();
-        Serial.println("OFF");
-      }
-    }
-  }
-  lastReading = reading;
-
-  // 2. Read score command from Python over Serial
   if (Serial.available() > 0) {
     String msg = Serial.readStringUntil('\n');
     msg.trim();
 
     if (msg.length() == 0) return;
 
-    if (msg.equalsIgnoreCase("OFF") || msg == "0") {
-      turnOffLeds();
-    } else {
+    if (msg.startsWith("NEW_VOTE")) {
+      int count = 1;
+      int colonIdx = msg.indexOf(':');
+      if (colonIdx != -1) {
+        count = msg.substring(colonIdx + 1).toInt();
+      }
+      playNewVoteBeep(max(1, count));
+    } 
+    else if (msg.equalsIgnoreCase("AVG_UP")) {
+      playAvgUpBeep();
+    } 
+    else if (msg.equalsIgnoreCase("AVG_DOWN")) {
+      playAvgDownBeep();
+    } 
+    else if (msg.startsWith("LEVEL:")) {
+      int count = msg.substring(6).toInt();
+      setLeds(count);
+    } 
+    else {
+      // Raw integer level fallback
       float val = msg.toFloat();
-      int roundedCount = round(val);
-      showRatingGradually(roundedCount);
+      setLeds(round(val));
     }
   }
 }
