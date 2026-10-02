@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Send, 
-  CheckCircle2, 
-  AlertCircle, 
-  RefreshCw 
+import {
+  Send,
+  CheckCircle2,
+  AlertCircle,
+  RefreshCw
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { supabase, isConfigured } from './supabaseClient';
@@ -94,7 +94,7 @@ export default function App() {
           origin: { y: 0.65 },
           colors: ['#111827', '#6b7280', '#9ca3af', '#d1d5db']
         });
-      } catch (e) {}
+      } catch (e) { }
 
       fetchStats();
     } catch (err) {
@@ -132,10 +132,10 @@ export default function App() {
         )}
 
         <div className="rating-card">
-          <h1 className="rating-title">Rate your experience</h1>
-          <p className="rating-subtitle">
-            Choose a score from 1 to 5 to save directly into the Supabase database.
-          </p>
+          <h1 className="rating-title">Rate the Rap</h1>
+          {/* <p className="rating-subtitle">
+            Choose a score from 1 to 5.
+          </p> */}
 
           {/* Feedback Label Banner */}
           <div className="rating-feedback-display">
@@ -174,11 +174,11 @@ export default function App() {
           </div>
 
           {/* Anchors */}
-          <div className="scale-anchors">
+          {/* <div className="scale-anchors">
             <span>1 (Poor)</span>
             <span>3 (Average)</span>
             <span>5 (Exceptional)</span>
-          </div>
+          </div> */}
 
           {/* Error Message */}
           {errorMessage && (
@@ -189,7 +189,7 @@ export default function App() {
           )}
 
           {/* Success Message Banner */}
-          {submitSuccess !== null && (
+          {/* {submitSuccess !== null && (
             <div className="alert-box success" id="success-message">
               <CheckCircle2 size={20} />
               <div>
@@ -197,7 +197,7 @@ export default function App() {
                 <p>Recorded to Supabase table <code>public.ratings</code>.</p>
               </div>
             </div>
-          )}
+          )} */}
 
           {/* Actions */}
           <div className="rating-actions">
@@ -227,7 +227,7 @@ export default function App() {
                 ) : (
                   <>
                     <Send size={18} />
-                    <span>Submit Rating</span>
+                    <span>Submit</span>
                   </>
                 )}
               </button>
@@ -236,7 +236,7 @@ export default function App() {
         </div>
 
         {/* Aggregate Stats */}
-        {isConfigured && stats.total > 0 && (
+        {/* {isConfigured && stats.total > 0 && (
           <div className="stats-panel">
             <div className="stat-item">
               <span className="stat-num mono-num">{stats.average}</span>
@@ -248,7 +248,7 @@ export default function App() {
               <span>total ratings</span>
             </div>
           </div>
-        )}
+        )} */}
       </main>
     </div>
   );
