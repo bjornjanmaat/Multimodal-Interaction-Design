@@ -11,16 +11,11 @@ import { playVoteSound } from './utils/audio';
 import './App.css';
 
 const RATING_DESCRIPTIONS = {
-  1: { label: 'Poor', color: '#ef4444' },
-  2: { label: 'Very Subpar', color: '#f97316' },
-  3: { label: 'Needs Improvement', color: '#f59e0b' },
-  4: { label: 'Below Average', color: '#eab308' },
-  5: { label: 'Average / Fair', color: '#84cc16' },
-  6: { label: 'Decent', color: '#10b981' },
-  7: { label: 'Good', color: '#06b6d4' },
-  8: { label: 'Very Good', color: '#3b82f6' },
-  9: { label: 'Great', color: '#6366f1' },
-  10: { label: 'Exceptional!', color: '#a855f7' }
+  1: { label: 'Poor' },
+  2: { label: 'Fair' },
+  3: { label: 'Average' },
+  4: { label: 'Good' },
+  5: { label: 'Exceptional!' }
 };
 
 export default function App() {
@@ -70,7 +65,7 @@ export default function App() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!selectedRating) {
-      setErrorMessage('Please select a rating between 1 and 10.');
+      setErrorMessage('Please select a rating between 1 and 5.');
       return;
     }
 
@@ -139,24 +134,24 @@ export default function App() {
         <div className="rating-card">
           <h1 className="rating-title">Rate your experience</h1>
           <p className="rating-subtitle">
-            Choose a score from 1 to 10 to save directly into the Supabase database.
+            Choose a score from 1 to 5 to save directly into the Supabase database.
           </p>
 
           {/* Feedback Label Banner */}
           <div className="rating-feedback-display">
             {currentDetails ? (
               <div className="feedback-pill">
-                <span className="feedback-score mono-num">{activeDisplayRating} / 10</span>
+                <span className="feedback-score mono-num">{activeDisplayRating} / 5</span>
                 <span className="feedback-text">— {currentDetails.label}</span>
               </div>
             ) : (
-              <span className="feedback-placeholder">Select a score from 1 to 10</span>
+              <span className="feedback-placeholder">Select a score from 1 to 5</span>
             )}
           </div>
 
-          {/* 1 - 10 Rating Buttons */}
-          <div className="rating-buttons-grid" role="radiogroup" aria-label="Rating 1 to 10">
-            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((num) => {
+          {/* 1 - 5 Rating Buttons */}
+          <div className="rating-buttons-grid" role="radiogroup" aria-label="Rating 1 to 5">
+            {[1, 2, 3, 4, 5].map((num) => {
               const isSelected = selectedRating === num;
 
               return (
@@ -181,8 +176,8 @@ export default function App() {
           {/* Anchors */}
           <div className="scale-anchors">
             <span>1 (Poor)</span>
-            <span>5 (Average)</span>
-            <span>10 (Exceptional)</span>
+            <span>3 (Average)</span>
+            <span>5 (Exceptional)</span>
           </div>
 
           {/* Error Message */}
@@ -198,7 +193,7 @@ export default function App() {
             <div className="alert-box success" id="success-message">
               <CheckCircle2 size={20} />
               <div>
-                <strong>Rating of {submitSuccess}/10 saved!</strong>
+                <strong>Rating of {submitSuccess}/5 saved!</strong>
                 <p>Recorded to Supabase table <code>public.ratings</code>.</p>
               </div>
             </div>
