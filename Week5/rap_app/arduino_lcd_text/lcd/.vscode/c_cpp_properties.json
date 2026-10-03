@@ -6,8 +6,8 @@
                 "${workspaceFolder}/**",
                 "/Users/bjornjanmaat/Library/Arduino15/packages/arduino/hardware/avr/1.8.8/cores/arduino",
                 "/Users/bjornjanmaat/Library/Arduino15/packages/arduino/hardware/avr/1.8.8/variants/standard",
-                "/Users/bjornjanmaat/Library/Arduino15/packages/arduino/hardware/avr/1.8.8/libraries/Wire/src",
                 "/Users/bjornjanmaat/Documents/Arduino/libraries/LiquidCrystal_I2C",
+                "/Users/bjornjanmaat/Library/Arduino15/packages/arduino/hardware/avr/1.8.8/libraries/Wire/src",
                 "/Users/bjornjanmaat/Library/Arduino15/packages/arduino/tools/avr-gcc/7.3.0-atmel3.6.1-arduino7/avr/include"
             ],
             "forcedInclude": [
