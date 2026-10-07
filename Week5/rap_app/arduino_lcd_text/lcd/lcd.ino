@@ -5,8 +5,8 @@
 LiquidCrystal_I2C lcd(0x26, 20, 4);
 
 // Button / Switch Pins (Internal Pull-Up: Connect button/switch to GND)
-const int MIC_SWITCH_PIN = 7;    // Pin 7: Mic toggle switch (ON/OFF)
-const int START_BUTTON_PIN = 9;  // Pin 9: Battle Start button
+const int MIC_SWITCH_PIN = 7;   // Pin 7: Mic toggle switch (ON/OFF)
+const int START_BUTTON_PIN = 9; // Pin 9: Battle Start button
 
 // Mic switch debounce state
 int lastMicReading = HIGH;
@@ -20,9 +20,11 @@ unsigned long lastStartDebounce = 0;
 
 const unsigned long DEBOUNCE_DELAY = 50;
 
-// Helper function to write a full 20-char line, padding remaining characters with spaces
+// Helper function to write a full 20-char line, padding remaining characters
+// with spaces
 void writeRow(int row, String text) {
-  if (row < 0 || row >= 4) return;
+  if (row < 0 || row >= 4)
+    return;
   lcd.setCursor(0, row);
   int len = text.length();
   for (int i = 0; i < 20; i++) {
@@ -47,7 +49,8 @@ String lines[MAX_LINES];
 int totalLines = 0;
 int currentScrollLine = 0;
 unsigned long lastScrollTime = 0;
-const unsigned long SCROLL_INTERVAL = 1800; // Time each 4-line view is shown (ms)
+const unsigned long SCROLL_INTERVAL =
+    1800; // Time each 4-line view is shown (ms)
 bool isScrolling = false;
 
 // Render 4 lines starting from startIdx
@@ -62,7 +65,8 @@ void renderWindow(int startIdx) {
   }
 }
 
-// Word-wrap any incoming text into lines of up to 20 characters and start scrolling
+// Word-wrap any incoming text into lines of up to 20 characters and start
+// scrolling
 void setText(String text) {
   totalLines = 0;
   currentScrollLine = 0;
@@ -117,7 +121,7 @@ void setup() {
   lcd.backlight(); // Turn on backlight
 
   // Initial welcome screen
-  setText("Rap Battle Ready  Press Start Button  Pin 9 to begin!");
+  setText("Are you ready to battle!?");
 
   Serial.println("LCD_READY");
 
@@ -183,8 +187,7 @@ void loop() {
         totalLines = 0;
         clearAll();
         Serial.println("ACK:CLEARED");
-      } 
-      else if (msg.equalsIgnoreCase("STATUS")) {
+      } else if (msg.equalsIgnoreCase("STATUS")) {
         if (micState == LOW) {
           Serial.println("MIC:ON");
           Serial.println("BTN:ON");
@@ -192,8 +195,7 @@ void loop() {
           Serial.println("MIC:OFF");
           Serial.println("BTN:OFF");
         }
-      }
-      else if (msg.startsWith("LINE:")) {
+      } else if (msg.startsWith("LINE:")) {
         // Format: LINE:<row>:<text>
         isScrolling = false;
         int firstColon = msg.indexOf(':');
@@ -204,12 +206,10 @@ void loop() {
           writeRow(row, content);
           Serial.println("ACK:ROW_" + String(row));
         }
-      } 
-      else if (msg.startsWith("TEXT:")) {
+      } else if (msg.startsWith("TEXT:")) {
         setText(msg.substring(5));
         Serial.println("ACK:TEXT_UPDATED");
-      } 
-      else {
+      } else {
         // Raw string fallback
         setText(msg);
         Serial.println("ACK:TEXT_UPDATED");
@@ -231,4 +231,3 @@ void loop() {
     }
   }
 }
-

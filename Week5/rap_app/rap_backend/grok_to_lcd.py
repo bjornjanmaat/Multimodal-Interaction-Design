@@ -22,6 +22,7 @@ import textwrap
 import argparse
 import threading
 import subprocess
+import atexit
 import requests
 import speech_recognition as sr
 from dotenv import load_dotenv
@@ -59,6 +60,16 @@ TTS_AUDIO_FILE = "/tmp/grok_tts_rap.mp3"
 UHH_AUDIO_FILE = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "assets", "uhh.mpeg")
 )
+BEAT_AUDIO_FILE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "assets", "beat.mpeg")
+)
+
+# -----------------------------
+# AUDIO VOLUME CONFIGURATION (0.0 to 1.0+)
+# -----------------------------
+BEAT_VOLUME = float(os.getenv("BEAT_VOLUME", "0.35"))   # Rap beat backing track volume
+GROK_VOLUME = float(os.getenv("GROK_VOLUME", "1.0"))    # Grok battle bars voice volume
+UHH_VOLUME = float(os.getenv("UHH_VOLUME", "0.6"))      # 'Uhh' ad-lib sound effect volume
 
 
 def find_arduino_ports():
@@ -128,10 +139,12 @@ def update_lcd(arduino, text):
     send_to_arduino(arduino, f"TEXT:{clean_text}")
 
 
-def speak_with_grok_tts(text, voice_id=DEFAULT_VOICE):
+def speak_with_grok_tts(text, voice_id=DEFAULT_VOICE, volume=None):
     """Synthesize speech using official xAI Grok TTS and play via afplay."""
     if not text:
         return
+    if volume is None:
+        volume = GROK_VOLUME
 
     clean = text.replace("*", "").replace("#", "").replace('"', '').strip()
 
@@ -152,8 +165,8 @@ def speak_with_grok_tts(text, voice_id=DEFAULT_VOICE):
             if res.status_code == 200:
                 with open(TTS_AUDIO_FILE, "wb") as f:
                     f.write(res.content)
-                print(f"🔊 Playing Grok voice ({len(res.content):,} bytes)...")
-                subprocess.run(["afplay", TTS_AUDIO_FILE], check=False)
+                print(f"🔊 Playing Grok voice ({len(res.content):,} bytes, vol: {volume})...")
+                subprocess.run(["afplay", "-v", str(volume), TTS_AUDIO_FILE], check=False)
                 return
             else:
                 print(f"⚠️  xAI TTS returned {res.status_code}: {res.text}")
@@ -168,8 +181,10 @@ def speak_with_grok_tts(text, voice_id=DEFAULT_VOICE):
         print(f"⚠️  TTS error: {e}")
 
 
-def play_uhh_sound():
+def play_uhh_sound(volume=None):
     """Play the assets/uhh.mpeg sound effect when the mic is switched off."""
+    if volume is None:
+        volume = UHH_VOLUME
     target_file = UHH_AUDIO_FILE
     if not os.path.exists(target_file):
         alt = os.path.abspath(os.path.join(os.getcwd(), "assets", "uhh.mpeg"))
@@ -180,13 +195,79 @@ def play_uhh_sound():
             return
 
     try:
-        print(f"🔊 [Sound FX] Playing {os.path.basename(target_file)}...")
+        print(f"🔊 [Sound FX] Playing {os.path.basename(target_file)} (vol: {volume})...")
         if sys.platform == "darwin":
-            subprocess.Popen(["afplay", target_file])
+            subprocess.Popen(["afplay", "-v", str(volume), target_file])
         else:
             subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", target_file])
     except Exception as e:
         print(f"⚠️  Error playing sound effect: {e}")
+
+
+beat_thread = None
+beat_process = None
+beat_stop_event = threading.Event()
+
+
+def _beat_loop_worker():
+    global beat_process
+    target_file = BEAT_AUDIO_FILE
+    if not os.path.exists(target_file):
+        alt = os.path.abspath(os.path.join("assets", "beat.mpeg"))
+        if os.path.exists(alt):
+            target_file = alt
+        else:
+            print(f"⚠️  Beat audio file not found: {target_file}")
+            return
+
+    print(f"🎵 [Beat Loop] Started looping {os.path.basename(target_file)} (vol: {BEAT_VOLUME})...")
+    while not beat_stop_event.is_set():
+        try:
+            if sys.platform == "darwin":
+                beat_process = subprocess.Popen(["afplay", "-v", str(BEAT_VOLUME), target_file])
+            else:
+                beat_process = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", target_file])
+
+            while beat_process.poll() is None:
+                if beat_stop_event.is_set():
+                    beat_process.terminate()
+                    try:
+                        beat_process.wait(timeout=0.5)
+                    except Exception:
+                        beat_process.kill()
+                    return
+                time.sleep(0.05)
+        except Exception as e:
+            print(f"⚠️  Beat loop error: {e}")
+            break
+
+
+def start_beat_loop():
+    """Start playing assets/beat.mpeg in a loop in the background."""
+    global beat_thread, beat_stop_event
+    if beat_thread and beat_thread.is_alive():
+        return
+    beat_stop_event.clear()
+    beat_thread = threading.Thread(target=_beat_loop_worker, daemon=True)
+    beat_thread.start()
+
+
+def stop_beat_loop():
+    """Stop the beat loop and terminate any active player process."""
+    global beat_stop_event, beat_process
+    beat_stop_event.set()
+    if beat_process and beat_process.poll() is None:
+        try:
+            beat_process.terminate()
+            beat_process.wait(timeout=0.5)
+        except Exception:
+            try:
+                beat_process.kill()
+            except Exception:
+                pass
+
+
+atexit.register(stop_beat_loop)
 
 
 def ask_grok(user_input, history=None):
@@ -202,7 +283,7 @@ def ask_grok(user_input, history=None):
     }
     system_prompt = (
         "You are an energetic, witty freestyle rap battle host and opponent. "
-        "The user will rap or speak to you. Respond directly with 2 couplets of rap. "
+        "The user will rap or speak to you. Respond directly with 2 couplets of rap. Use maximum 20 words total."
         "Punchy, rhyming freestyle rap bars reacting to what they said. Keep it clever and rhythmic. "
         "Output ONLY the rap lyrics without intro notes."
         "Talk fast like an actual rapper."
@@ -350,12 +431,21 @@ def grok_start_battle(arduino, osc_client, voice_name, history):
 
 
 def main():
+    global BEAT_VOLUME, GROK_VOLUME, UHH_VOLUME
+
     parser = argparse.ArgumentParser(description="Grok AI Voice Rap Battle with Arduino")
     parser.add_argument("--voice", type=str, default=DEFAULT_VOICE, help=f"xAI TTS voice ID (default: {DEFAULT_VOICE}, e.g. eve, rex, ara, leo)")
     parser.add_argument("--port", type=str, default=None, help="Serial port for Arduino LCD")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baud rate (default: 9600)")
     parser.add_argument("--phrase-limit", type=int, default=5, help="Max voice phrase recording seconds (default: 5s)")
+    parser.add_argument("--beat-volume", type=float, default=BEAT_VOLUME, help=f"Beat audio volume from 0.0 to 1.0+ (default: {BEAT_VOLUME})")
+    parser.add_argument("--grok-volume", type=float, default=GROK_VOLUME, help=f"Grok voice volume from 0.0 to 1.0+ (default: {GROK_VOLUME})")
+    parser.add_argument("--uhh-volume", type=float, default=UHH_VOLUME, help=f"Uhh sound FX volume from 0.0 to 1.0+ (default: {UHH_VOLUME})")
     args = parser.parse_args()
+
+    BEAT_VOLUME = args.beat_volume
+    GROK_VOLUME = args.grok_volume
+    UHH_VOLUME = args.uhh_volume
 
     voice_name = args.voice
     explicit_port = args.port
@@ -365,6 +455,7 @@ def main():
     print("=" * 60)
     print("🔥 GROK RAP BATTLE (VOICE + ARDUINO LCD)")
     print(f"   Model: {GROK_MODEL} | Voice: {voice_name}")
+    print(f"   Volumes: Beat={BEAT_VOLUME} | Grok={GROK_VOLUME} | FX={UHH_VOLUME}")
     print("=" * 60)
 
     # Setup OSC
@@ -391,7 +482,7 @@ def main():
     print("\n🔌 Connecting to Arduino LCD...")
     arduino, port = try_connect_arduino(explicit_port, baud)
     if arduino:
-        update_lcd(arduino, "Press Pin 9 Button\nto start battle!")
+        update_lcd(arduino, "Are you ready to battle!?")
         send_to_arduino(arduino, "STATUS")
     else:
         print("⚠️  Arduino not found initially. Script will retry in background.")
@@ -418,6 +509,7 @@ def main():
                     if line == "START_BTN:PRESSED":
                         print("\n🔘 [Start Button Pin 9 Pressed]")
                         start_requested = True
+                        start_beat_loop()
                     elif line in ["MIC:ON", "BTN:ON"]:
                         if not mic_active:
                             mic_active = True
@@ -458,6 +550,7 @@ def main():
                 start_requested = False
                 is_busy = True
                 battle_started = True
+                start_beat_loop()
                 grok_start_battle(arduino, osc_client, voice_name, history)
                 is_busy = False
 
@@ -486,6 +579,7 @@ def main():
 
         except (KeyboardInterrupt, EOFError):
             print("\n👋 Battle finished. Goodbye!")
+            stop_beat_loop()
             if arduino and arduino.is_open:
                 send_to_arduino(arduino, "CLEAR")
                 send_to_arduino(arduino, "LINE:0:Grok Offline")
