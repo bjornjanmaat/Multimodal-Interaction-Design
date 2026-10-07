@@ -89,6 +89,30 @@ def fetch_ratings_and_average(url, key):
         return None, None, None, None
 
 
+def compute_partition_leds(man_votes, machine_votes):
+    """Calculate 0-3 LED partition for Man and Machine based on vote share."""
+    total = man_votes + machine_votes
+    if total <= 0:
+        return 0, 0
+    if machine_votes == 0:
+        return 3, 0
+    if man_votes == 0:
+        return 0, 3
+
+    man_share = man_votes / total
+    machine_share = machine_votes / total
+
+    man_leds = round(man_share * 3.0)
+    machine_leds = round(machine_share * 3.0)
+
+    if man_votes > 0 and man_leds < 1:
+        man_leds = 1
+    if machine_votes > 0 and machine_leds < 1:
+        machine_leds = 1
+
+    return max(0, min(3, man_leds)), max(0, min(3, machine_leds))
+
+
 def try_connect_arduino(explicit_port=None, baud=9600):
     """Attempt connection to explicit port or any detected USB Arduino."""
     ports_to_try = [explicit_port] if explicit_port else find_arduino_ports()
@@ -98,8 +122,21 @@ def try_connect_arduino(explicit_port=None, baud=9600):
             continue
         try:
             ser = serial.Serial(p, baud, timeout=0.1)
-            time.sleep(2)  # Wait for Arduino reset
-            print(f" Connected to Arduino on {p}")
+            print(f"⏳ Waiting for Arduino on {p} to finish booting...")
+            start_wait = time.time()
+            ready_found = False
+            while time.time() - start_wait < 3.5:
+                if ser.in_waiting:
+                    line = ser.readline().decode("utf-8", "ignore").strip()
+                    if line:
+                        print(f"   [Arduino boot] {line}")
+                    if "READY" in line:
+                        ready_found = True
+                        break
+                time.sleep(0.05)
+
+            time.sleep(0.2)
+            print(f"✅ Connected and synchronized with Arduino on {p}")
             return ser, p
         except (serial.SerialException, OSError):
             continue
@@ -113,7 +150,7 @@ def send_to_arduino(arduino, command):
         try:
             arduino.write(f"{command}\n".encode())
             arduino.flush()
-            time.sleep(0.05)
+            time.sleep(0.03)
             return True
         except (serial.SerialException, OSError) as e:
             print(f"❌ Serial write error: {e}")
@@ -135,21 +172,19 @@ def main():
     url, key = get_supabase_credentials()
 
     print("=" * 65)
-    print("🌟 Supabase Auto-Polling Rating Monitor")
+    print("🌟 Supabase Auto-Polling Vote Partition Monitor")
     print(f"📡 Supabase URL: {url}")
-    print(f"💡 LEDs: Pins 2, 3, 4, 5, 6 (displays rounded average 1-5)")
-    print(f"🔊 Buzzer: Pin 13")
-    print(f"   • High beep on every new vote")
-    print(f"   • High pitch alert if rounded average goes UP")
-    print(f"   • Low pitch alert if rounded average goes DOWN")
-    print(f"⏱️  Auto-Poll Interval: {interval}s")
+    print(f"💡 Man LEDs (3 LEDs):     Pins 8, 9, 10")
+    print(f"💡 Machine LEDs (3 LEDs): Pins 11, 12, 13")
+    print(f"⏱️  Auto-Poll Interval:    {interval}s")
     print("=" * 65)
 
     arduino = None
     connected_port = None
 
     last_total = None
-    last_rounded_avg = None
+    last_man_leds = None
+    last_machine_leds = None
 
     try:
         while True:
@@ -162,54 +197,50 @@ def main():
                     continue
                 else:
                     print(f"\n Active connection on {connected_port}. Monitoring Supabase...")
-                    # Resend current level if known
-                    if last_rounded_avg is not None:
-                        send_to_arduino(arduino, f"LEVEL:{last_rounded_avg}")
+                    if last_man_leds is not None and last_machine_leds is not None:
+                        send_to_arduino(arduino, f"LEDS:{last_man_leds},{last_machine_leds}")
 
             # 2. Fetch latest scores from Supabase
             total, machine_count, man_count, machine_ratio = fetch_ratings_and_average(url, key)
 
             if total is not None:
-                rounded_level = max(0, min(5, round(machine_ratio * 5))) if total > 0 else 0
+                man_leds, machine_leds = compute_partition_leds(man_count, machine_count)
 
                 # Initial fetch
                 if last_total is None:
                     last_total = total
-                    last_rounded_avg = rounded_level
-                    send_to_arduino(arduino, f"LEVEL:{rounded_level}")
-                    active_pins = [f"Pin {p}" for p in range(2, 2 + rounded_level)]
-                    pins_str = ", ".join(active_pins) if active_pins else "None"
-                    print(f" Initial State: {total} votes (Machine: {machine_count}, Man: {man_count}) | Machine share: {machine_ratio * 100:.0f}% → LEDs: Level {rounded_level}/5 ({pins_str})")
+                    last_man_leds = man_leds
+                    last_machine_leds = machine_leds
+
+                    send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
+
+                    man_pins = [f"Pin {p}" for p in [8, 9, 10][:man_leds]] or ["None"]
+                    machine_pins = [f"Pin {p}" for p in [11, 12, 13][:machine_leds]] or ["None"]
+                    print(f" Initial State: {total} votes total")
+                    print(f"   🧑 Man:     {man_count} votes → {man_leds}/3 LEDs ({', '.join(man_pins)})")
+                    print(f"   🤖 Machine: {machine_count} votes → {machine_leds}/3 LEDs ({', '.join(machine_pins)})")
 
                 else:
                     # Check if new votes arrived
                     if total > last_total:
                         diff = total - last_total
-                        print(f"\n🗳️  [NEW VOTE] +{diff} new vote(s) received! (Total: {total} | Machine: {machine_count}, Man: {man_count})")
-                        # Send count so Arduino beeps once per new vote
+                        print(f"\n🗳️  [NEW VOTE] +{diff} new vote(s) received! (Total: {total} | Man: {man_count}, Machine: {machine_count})")
                         send_to_arduino(arduino, f"NEW_VOTE:{diff}")
-                        # Allow time for beeps to complete (160ms tone + 90ms gap = ~250ms each)
-                        time.sleep(diff * 0.26)
+                        time.sleep(diff * 0.15)
+                        send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
 
-                    # Check if machine level changed
-                    if rounded_level > last_rounded_avg:
-                        print(f"📈 [RATIO SHIFT] Machine share went up: Level {last_rounded_avg} → {rounded_level} ({machine_ratio * 100:.0f}% Machine)")
-                        send_to_arduino(arduino, "AVG_UP")
-                        time.sleep(0.2)
-                        send_to_arduino(arduino, f"LEVEL:{rounded_level}")
+                    # Check if LED partition changed
+                    elif man_leds != last_man_leds or machine_leds != last_machine_leds:
+                        print(f"📊 [PARTITION SHIFT] Man: {last_man_leds}→{man_leds}/3 LEDs | Machine: {last_machine_leds}→{machine_leds}/3 LEDs")
+                        send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
 
-                    elif rounded_level < last_rounded_avg:
-                        print(f"📉 [RATIO SHIFT] Machine share went down: Level {last_rounded_avg} → {rounded_level} ({machine_ratio * 100:.0f}% Machine)")
-                        send_to_arduino(arduino, "AVG_DOWN")
-                        time.sleep(0.2)
-                        send_to_arduino(arduino, f"LEVEL:{rounded_level}")
-
-                    elif total > last_total:
-                        # Share remained the same, but still refresh LED level just in case
-                        send_to_arduino(arduino, f"LEVEL:{rounded_level}")
+                    else:
+                        # Heartbeat re-sync so LEDs never desynchronize
+                        send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
 
                     last_total = total
-                    last_rounded_avg = rounded_level
+                    last_man_leds = man_leds
+                    last_machine_leds = machine_leds
 
             # Read any serial responses from Arduino (non-blocking)
             try:

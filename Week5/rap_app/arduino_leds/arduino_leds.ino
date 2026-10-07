@@ -1,115 +1,227 @@
 /*
- * Arduino 5-LED & Piezo Buzzer Live Rating Monitor
+ * Arduino 6-LED Vote Partition Monitor (Man vs Machine)
  * 
- * Hardware:
- * - LEDs: 
- *     Light 1 -> Pin 2 (through 220Ω resistor to GND)
- *     Light 2 -> Pin 3 (through 220Ω resistor to GND)
- *     Light 3 -> Pin 4 (through 220Ω resistor to GND)
- *     Light 4 -> Pin 5 (through 220Ω resistor to GND)
- *     Light 5 -> Pin 6 (through 220Ω resistor to GND)
- * - Buzzer: Pin 13 (positive leg to Pin 13, negative leg to GND)
- *   (Tip: If Pin 13 is too quiet due to the onboard LED, you can move it to Pin 11)
+ * Hardware Setup:
+ * - Man Party (3 LEDs):
+ *     LED 1 -> Pin 8  (through 220Ω resistor to GND)
+ *     LED 2 -> Pin 9  (through 220Ω resistor to GND)
+ *     LED 3 -> Pin 10 (through 220Ω resistor to GND)
  * 
- * Behavior:
- * 1. Startup Diagnostic: Lights up each LED 1-by-1 (Pins 2 to 6) and beeps buzzer
- *    so you can instantly verify all 5 LEDs and the buzzer are working.
- * 2. Real-time LED Level: LEDs (Pins 2 to 6) stay ON showing the rounded average rating.
- * 3. New Vote: Plays a high beep when a new vote arrives.
- * 4. Average UP: Plays a high-pitch ascending alert.
- * 5. Average DOWN: Plays a low-pitch descending alert.
+ * - Machine Party (3 LEDs):
+ *     LED 1 -> Pin 11 (through 220Ω resistor to GND)
+ *     LED 2 -> Pin 12 (through 220Ω resistor to GND)
+ *     LED 3 -> Pin 13 (through 220Ω resistor to GND)
+ * 
+ * Wiring Checklist:
+ * 1. Anode (long leg of LED) -> Arduino Pin (8, 9, 10, 11, 12, or 13)
+ * 2. Cathode (short leg of LED) -> 220Ω resistor -> Arduino GND rail
+ * 3. Make sure the breadboard GND rail is connected back to one of the Arduino GND pins!
+ * 4. If your LEDs turn on with LOW (common anode / connected to 5V), change ACTIVE_LOW to true below.
  */
 
-const int LED_PINS[] = {2, 3, 4, 5, 6};
-const int NUM_LEDS = 5;
+// ---------------- Pins Configuration ----------------
+const int MAN_PINS[] = {8, 9, 10};
+const int MACHINE_PINS[] = {11, 12, 13};
+const int LEDS_PER_PARTY = 3;
 
-// Change to 11 if Pin 13 onboard LED interferes with buzzer volume
-const int BUZZER_PIN = 13;
+// Active logic: Set to false for standard GND wiring (HIGH=ON). Set to true if wired to 5V (LOW=ON).
+bool activeLow = false;
 
-int currentLevel = 0;
+#define PIN_ON  (activeLow ? LOW : HIGH)
+#define PIN_OFF (activeLow ? HIGH : LOW)
 
-void setLeds(int count) {
-  if (count < 0) count = 0;
-  if (count > NUM_LEDS) count = NUM_LEDS;
-  currentLevel = count;
+// Optional Buzzer: Set to a dedicated pin (e.g. Pin 7), or -1 to disable
+const int BUZZER_PIN = -1;
 
-  for (int i = 0; i < NUM_LEDS; i++) {
-    if (i < count) {
-      digitalWrite(LED_PINS[i], HIGH);
-    } else {
-      digitalWrite(LED_PINS[i], LOW);
-    }
+// Current state
+int currentManLeds = 0;
+int currentMachineLeds = 0;
+
+// ---------------- LED Control Functions ----------------
+
+void setManLeds(int count) {
+  count = constrain(count, 0, LEDS_PER_PARTY);
+  currentManLeds = count;
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    digitalWrite(MAN_PINS[i], (i < count) ? PIN_ON : PIN_OFF);
   }
 }
 
-// Sound generator (compatible with both passive and active buzzers)
+void setMachineLeds(int count) {
+  count = constrain(count, 0, LEDS_PER_PARTY);
+  currentMachineLeds = count;
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    digitalWrite(MACHINE_PINS[i], (i < count) ? PIN_ON : PIN_OFF);
+  }
+}
+
+void setPartyLeds(int manCount, int machineCount) {
+  setManLeds(manCount);
+  setMachineLeds(machineCount);
+}
+
+// ---------------- Diagnostic Self-Test ----------------
+
+void runSelfTest() {
+  Serial.println("--- Starting LED Diagnostic Test ---");
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    Serial.print("Testing Man Pin ");
+    Serial.println(MAN_PINS[i]);
+    digitalWrite(MAN_PINS[i], PIN_ON);
+    delay(200);
+    digitalWrite(MAN_PINS[i], PIN_OFF);
+  }
+
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    Serial.print("Testing Machine Pin ");
+    Serial.println(MACHINE_PINS[i]);
+    digitalWrite(MACHINE_PINS[i], PIN_ON);
+    delay(200);
+    digitalWrite(MACHINE_PINS[i], PIN_OFF);
+  }
+
+  // Flash all 6 together twice
+  for (int f = 0; f < 2; f++) {
+    setPartyLeds(3, 3);
+    delay(200);
+    setPartyLeds(0, 0);
+    delay(100);
+  }
+  Serial.println("--- Diagnostic Test Complete ---");
+}
+
+// ---------------- Vote Partition Logic ----------------
+
+void calculatePartition(int manVotes, int machineVotes, int &manLeds, int &machineLeds) {
+  int total = manVotes + machineVotes;
+
+  if (total <= 0) {
+    manLeds = 0;
+    machineLeds = 0;
+    return;
+  }
+
+  // 100% Man
+  if (machineVotes == 0) {
+    manLeds = 3;
+    machineLeds = 0;
+    return;
+  }
+
+  // 100% Machine
+  if (manVotes == 0) {
+    manLeds = 0;
+    machineLeds = 3;
+    return;
+  }
+
+  // Both parties have votes: calculate proportional share
+  float manShare = (float)manVotes / (float)total;
+  float machineShare = (float)machineVotes / (float)total;
+
+  manLeds = round(manShare * 3.0);
+  machineLeds = round(machineShare * 3.0);
+
+  // Guarantee that any party with votes gets at least 1 LED
+  if (manVotes > 0 && manLeds < 1) manLeds = 1;
+  if (machineVotes > 0 && machineLeds < 1) machineLeds = 1;
+
+  // Cap at max 3 LEDs per party
+  manLeds = constrain(manLeds, 0, 3);
+  machineLeds = constrain(machineLeds, 0, 3);
+}
+
+void updatePartition(int manVotes, int machineVotes) {
+  int manLeds = 0;
+  int machineLeds = 0;
+  calculatePartition(manVotes, machineVotes, manLeds, machineLeds);
+  setPartyLeds(manLeds, machineLeds);
+
+  Serial.print("PARTITION: Man=");
+  Serial.print(manLeds);
+  Serial.print("/3, Machine=");
+  Serial.print(machineLeds);
+  Serial.println("/3");
+}
+
+// ---------------- Optional Sound / Feedback ----------------
+
 void beep(int freq, int durationMs) {
+  if (BUZZER_PIN <= 0) return;
   tone(BUZZER_PIN, freq, durationMs);
-  // Fallback for active buzzers that require DC HIGH
   digitalWrite(BUZZER_PIN, HIGH);
   delay(durationMs);
   noTone(BUZZER_PIN);
   digitalWrite(BUZZER_PIN, LOW);
 }
 
-// 1. High beep when new vote(s) are submitted (beeps 'count' times)
-void playNewVoteBeep(int count = 1) {
+void pulseNewVote(int count = 1) {
   if (count < 1) count = 1;
-  for (int i = 0; i < count; i++) {
-    beep(1200, 160);
-    if (i < count - 1) {
-      delay(90); // Short pause between consecutive beeps
+  
+  for (int c = 0; c < count; c++) {
+    if (BUZZER_PIN > 0) {
+      beep(1200, 140);
+    }
+
+    // Brief visual pulse
+    int savedMan = currentManLeds;
+    int savedMachine = currentMachineLeds;
+    setPartyLeds(0, 0);
+    delay(60);
+    setPartyLeds(savedMan, savedMachine);
+
+    if (c < count - 1) {
+      delay(120);
     }
   }
 }
 
-// 2. High-pitch chime when average goes UP
-void playAvgUpBeep() {
-  beep(1400, 110);
-  delay(50);
-  beep(1850, 160);
-}
-
-// 3. Low-pitch chime when average goes DOWN
-void playAvgDownBeep() {
-  beep(400, 140);
-  delay(50);
-  beep(250, 200);
-}
+// ---------------- Arduino Setup ----------------
 
 void setup() {
   Serial.begin(9600);
 
-  // Initialize LED pins as OUTPUT
-  for (int i = 0; i < NUM_LEDS; i++) {
-    pinMode(LED_PINS[i], OUTPUT);
-    digitalWrite(LED_PINS[i], LOW);
+  // Initialize Man LED pins
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    pinMode(MAN_PINS[i], OUTPUT);
+    digitalWrite(MAN_PINS[i], PIN_OFF);
   }
 
-  // Initialize Buzzer pin as OUTPUT
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-  noTone(BUZZER_PIN);
+  // Initialize Machine LED pins
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    pinMode(MACHINE_PINS[i], OUTPUT);
+    digitalWrite(MACHINE_PINS[i], PIN_OFF);
+  }
 
-  // -------------------------------------------------------------
-  // STARTUP SELF-TEST DIAGNOSTIC:
-  // Tests each LED sequentially so you can see if all 5 are wired correctly!
-  // -------------------------------------------------------------
-  for (int i = 0; i < NUM_LEDS; i++) {
-    digitalWrite(LED_PINS[i], HIGH);
-    beep(800 + (i * 250), 100);
+  // Optional Buzzer pin
+  if (BUZZER_PIN > 0) {
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+    noTone(BUZZER_PIN);
+  }
+
+  // Startup visual diagnostic: tests each pin sequentially
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    digitalWrite(MAN_PINS[i], PIN_ON);
     delay(150);
-    digitalWrite(LED_PINS[i], LOW);
-    delay(50);
+    digitalWrite(MAN_PINS[i], PIN_OFF);
   }
 
-  // Flash all 5 LEDs together once
-  setLeds(5);
-  delay(200);
-  setLeds(0);
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    digitalWrite(MACHINE_PINS[i], PIN_ON);
+    delay(150);
+    digitalWrite(MACHINE_PINS[i], PIN_OFF);
+  }
+
+  // Flash all 6 LEDs together once
+  setPartyLeds(3, 3);
+  delay(250);
+  setPartyLeds(0, 0);
 
   Serial.println("READY");
 }
+
+// ---------------- Arduino Loop ----------------
 
 void loop() {
   if (Serial.available() > 0) {
@@ -118,28 +230,58 @@ void loop() {
 
     if (msg.length() == 0) return;
 
-    if (msg.startsWith("NEW_VOTE")) {
+    // 1. Calculate partition from vote counts: "VOTES:man,machine" (e.g. "VOTES:5,3")
+    if (msg.startsWith("VOTES:")) {
+      int commaIdx = msg.indexOf(',');
+      if (commaIdx != -1) {
+        int manVotes = msg.substring(6, commaIdx).toInt();
+        int machineVotes = msg.substring(commaIdx + 1).toInt();
+        updatePartition(manVotes, machineVotes);
+      }
+    }
+    // 2. Direct LED count: "LEDS:man,machine" (e.g. "LEDS:2,1")
+    else if (msg.startsWith("LEDS:") || msg.startsWith("PARTITION:")) {
+      int colonIdx = msg.indexOf(':');
+      int commaIdx = msg.indexOf(',');
+      if (commaIdx != -1) {
+        int manLeds = msg.substring(colonIdx + 1, commaIdx).toInt();
+        int machineLeds = msg.substring(commaIdx + 1).toInt();
+        setPartyLeds(manLeds, machineLeds);
+        Serial.print("LEDS_SET: Man=");
+        Serial.print(manLeds);
+        Serial.print(", Machine=");
+        Serial.println(machineLeds);
+      }
+    }
+    // 3. New vote event: "NEW_VOTE" or "NEW_VOTE:count"
+    else if (msg.startsWith("NEW_VOTE")) {
       int count = 1;
       int colonIdx = msg.indexOf(':');
       if (colonIdx != -1) {
         count = msg.substring(colonIdx + 1).toInt();
       }
-      playNewVoteBeep(max(1, count));
-    } 
-    else if (msg.equalsIgnoreCase("AVG_UP")) {
-      playAvgUpBeep();
-    } 
-    else if (msg.equalsIgnoreCase("AVG_DOWN")) {
-      playAvgDownBeep();
-    } 
-    else if (msg.startsWith("LEVEL:")) {
-      int count = msg.substring(6).toInt();
-      setLeds(count);
-    } 
-    else {
-      // Raw integer level fallback
-      float val = msg.toFloat();
-      setLeds(round(val));
+      pulseNewVote(count);
+    }
+    // 4. Test command to blink all pins: "TEST"
+    else if (msg.equalsIgnoreCase("TEST")) {
+      runSelfTest();
+    }
+    // 5. Invert active logic toggle: "INVERT"
+    else if (msg.equalsIgnoreCase("INVERT")) {
+      activeLow = !activeLow;
+      Serial.print("LOGIC: Active-");
+      Serial.println(activeLow ? "LOW (5V Common)" : "HIGH (GND Common)");
+      setPartyLeds(currentManLeds, currentMachineLeds);
+    }
+    // 6. Turn ALL LEDs ON: "ALL_ON"
+    else if (msg.equalsIgnoreCase("ALL_ON")) {
+      setPartyLeds(3, 3);
+      Serial.println("ALL_ON: All 6 LEDs turned ON");
+    }
+    // 7. Turn ALL LEDs OFF: "ALL_OFF" or "RESET"
+    else if (msg.equalsIgnoreCase("ALL_OFF") || msg.equalsIgnoreCase("RESET") || msg.equalsIgnoreCase("CLEAR")) {
+      setPartyLeds(0, 0);
+      Serial.println("ALL_OFF: All 6 LEDs turned OFF");
     }
   }
 }
