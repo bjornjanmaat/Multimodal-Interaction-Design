@@ -36,6 +36,17 @@ try:
     import pyaudio
 except ImportError:
     pyaudio = None
+try:
+    import pyttsx3
+    HAS_PYTTSX3 = True
+except ImportError:
+    HAS_PYTTSX3 = False
+import numpy as np
+try:
+    import whisper
+    HAS_WHISPER = True
+except ImportError:
+    HAS_WHISPER = False
 from dotenv import load_dotenv
 
 # Load .env (looking for GROK_API_KEY and Supabase credentials)
@@ -59,10 +70,15 @@ except ImportError:
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROK_API_KEY = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROK_MODEL = os.getenv("GROK_MODEL", "grok-3-mini")
+GROQ_TIMEOUT = int(os.getenv("GROQ_TIMEOUT", "10"))
 GROK_TIMEOUT = int(os.getenv("GROK_TIMEOUT", "20"))
-DEFAULT_VOICE = "eve"          # xAI voice ID (e.g. eve, rex, ara, leo)
+DEFAULT_VOICE = "eve"          # Legacy voice ID
+DEFAULT_WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+DEFAULT_WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "en")
 DEFAULT_BAUD = 9600
 LCD_COLS = 20
 LCD_ROWS = 4
@@ -167,8 +183,8 @@ def update_lcd(arduino, text):
     send_to_arduino(arduino, f"TEXT:{clean_message}")
 
 
-def speak_with_grok_tts(text, voice_id=DEFAULT_VOICE, volume=None):
-    """Synthesize speech using official xAI Grok TTS and play via afplay."""
+def speak_with_python_tts(text, voice_id=None, volume=None):
+    """Synthesize speech using simple local Python TTS (fast, zero network latency)."""
     if not text:
         return
     if volume is None:
@@ -176,37 +192,32 @@ def speak_with_grok_tts(text, voice_id=DEFAULT_VOICE, volume=None):
 
     clean = text.replace("*", "").replace("#", "").replace('"', '').strip()
 
-    if GROK_API_KEY:
+    # 1. Primary: pyttsx3 (simple, fast Python TTS)
+    if HAS_PYTTSX3:
         try:
-            print(f"🎙️  Synthesizing Grok voice (voice: '{voice_id}')...")
-            url = "https://api.x.ai/v1/tts"
-            headers = {
-                "Authorization": f"Bearer {GROK_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "text": clean,
-                "voice_id": voice_id,
-                "language": "en",
-            }
-            res = requests.post(url, headers=headers, json=payload, timeout=15)
-            if res.status_code == 200:
-                with open(TTS_AUDIO_FILE, "wb") as f:
-                    f.write(res.content)
-                print(f"🔊 Playing Grok voice ({len(res.content):,} bytes, vol: {volume})...")
-                subprocess.run(["afplay", "-v", str(volume), TTS_AUDIO_FILE], check=False)
-                return
-            else:
-                print(f"⚠️  xAI TTS returned {res.status_code}: {res.text}")
+            print(f"🔊 Speaking with Python TTS (pyttsx3, vol: {volume})...")
+            engine = pyttsx3.init()
+            engine.setProperty("rate", 185)  # Punchy hip-hop cadence
+            engine.setProperty("volume", min(1.0, max(0.0, volume)))
+            engine.say(clean)
+            engine.runAndWait()
+            return
         except Exception as e:
-            print(f"⚠️  xAI TTS error: {e}")
+            print(f"⚠️  pyttsx3 error: {e}, falling back to system TTS...")
 
-    # Fallback to local macOS TTS
+    # 2. Fallback: local system TTS (instantaneous on macOS)
     try:
-        print(f"🔊 Fallback speaking with macOS TTS: \"{clean}\"")
-        subprocess.run(["say", clean], check=False)
+        print(f"🔊 Speaking with system TTS: \"{clean}\"")
+        if sys.platform == "darwin":
+            subprocess.run(["say", "-r", "185", clean], check=False)
+        else:
+            subprocess.run(["espeak", clean], check=False)
     except Exception as e:
         print(f"⚠️  TTS error: {e}")
+
+
+# Alias so existing calls continue to work seamlessly
+speak_with_grok_tts = speak_with_python_tts
 
 def play_host_wav(cue_name):
     """Play one pre-rendered Klattsch host line, blocking until it ends."""
@@ -482,17 +493,8 @@ def stop_vote_polling():
 atexit.register(stop_vote_polling)
 
 
-def ask_grok(user_input, history=None):
-    """Call Grok API to generate 2-4 punchy rhyming rap bars."""
-    if not GROK_API_KEY:
-        print("❌ Error: Missing GROK_API_KEY in .env.")
-        return None
-
-    url = "https://api.x.ai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROK_API_KEY}",
-        "Content-Type": "application/json"
-    }
+def ask_groq(user_input, history=None):
+    """Call Groq LPU API to generate ultra-fast rhyming rap bars (sub-500ms)."""
     system_prompt = (
         "You are an energetic, witty freestyle rap battle MC. "
         "You are rapping over a 4/4 hip-hop beat at 96 BPM (1 bar = 4 beats). "
@@ -511,33 +513,56 @@ def ask_grok(user_input, history=None):
         messages.extend(history[-4:])
     messages.append({"role": "user", "content": user_input})
 
-    # Try requested model first, then auto-fallback to ultra-fast grok-3-mini
-    models_to_try = [GROK_MODEL]
-    if GROK_MODEL != "grok-3-mini":
-        models_to_try.append("grok-3-mini")
+    # 1. Primary: Groq ultra-fast LPU API
+    if GROQ_API_KEY:
+        groq_url = "https://api.groq.com/openai/v1/chat/completions"
+        groq_headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        for model in [GROQ_MODEL, "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]:
+            try:
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": 80,
+                    "temperature": 0.85
+                }
+                res = requests.post(groq_url, headers=groq_headers, json=payload, timeout=GROQ_TIMEOUT)
+                if res.status_code == 200:
+                    reply = res.json()["choices"][0]["message"]["content"].strip()
+                    if reply:
+                        return reply
+            except Exception as e:
+                print(f"⚠️  Groq ({model}) error: {e}")
 
-    for model in models_to_try:
+    # 2. Fallback: xAI Grok
+    if GROK_API_KEY:
         try:
-            payload = {
-                "model": model,
-                "messages": messages,
-                "max_tokens": 100,
-                "temperature": 1
+            grok_url = "https://api.x.ai/v1/chat/completions"
+            grok_headers = {
+                "Authorization": f"Bearer {GROK_API_KEY}",
+                "Content-Type": "application/json"
             }
-            res = requests.post(url, headers=headers, json=payload, timeout=GROK_TIMEOUT)
+            res = requests.post(
+                grok_url,
+                headers=grok_headers,
+                json={
+                    "model": GROK_MODEL,
+                    "messages": messages,
+                    "max_tokens": 80,
+                    "temperature": 1.0
+                },
+                timeout=GROK_TIMEOUT
+            )
             if res.status_code == 200:
-                data = res.json()
-                reply = data["choices"][0]["message"]["content"].strip()
+                reply = res.json()["choices"][0]["message"]["content"].strip()
                 if reply:
                     return reply
-            else:
-                print(f"⚠️  Grok API ({model}) returned {res.status_code}: {res.text}")
-        except requests.exceptions.Timeout:
-            print(f"⚠️  Grok API ({model}) timed out (>{GROK_TIMEOUT}s). Trying next fallback...")
-        except requests.RequestException as e:
-            print(f"⚠️  Grok request error ({model}): {e}")
+        except Exception as e:
+            print(f"⚠️  xAI Grok fallback error: {e}")
 
-    # Emergency fallback rhyme so the battle NEVER hangs
+    # 3. Emergency fallback rhyme so the battle NEVER hangs
     print("⚡ Using emergency battle comeback bar...")
     emergency_fallbacks = [
         "You spitting fire or is my network slow?\nEither way I'm the king of this whole rap show!",
@@ -548,8 +573,12 @@ def ask_grok(user_input, history=None):
     return random.choice(emergency_fallbacks)
 
 
+# Alias for backward compatibility
+ask_grok = ask_groq
+
+
 def handle_rap_interaction(prompt, arduino, osc_client, voice_name, history):
-    """Send user input to Grok, display on LCD, and play voice."""
+    """Send user input to Groq, display on LCD, and speak with Python TTS."""
     print(f"\n🎤 Heard: \"{prompt}\"")
     prompt_clean = " ".join(prompt.strip().split())
     if len(prompt_clean) > 36:
@@ -557,25 +586,25 @@ def handle_rap_interaction(prompt, arduino, osc_client, voice_name, history):
     else:
         prompt_display = prompt_clean
 
-    print("\n🤖 Grok is writing bars in response...")
-    update_lcd(arduino, f"You: {prompt_display}\nGrok thinking...")
+    print("\n🤖 Machine (Groq) is writing bars in response...")
+    update_lcd(arduino, f"You: {prompt_display}\nMachine thinking...")
 
-    reply = ask_grok(prompt, history)
+    reply = ask_groq(prompt, history)
     if reply:
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": reply})
-        print(f"\n🔥 Grok:\n{reply}\n")
+        print(f"\n🔥 Machine (Groq):\n{reply}\n")
 
         # 1. Update LCD screen (auto-scrolls if long)
         if arduino and arduino.is_open:
-            update_lcd(arduino, f"Grok: {reply}")
+            update_lcd(arduino, f"Machine: {reply}")
 
         # 2. Broadcast via OSC
         if osc_client:
             osc_client.send_message("/grok/reply", reply)
 
-        # 3. Speak via xAI Grok TTS
-        speak_with_grok_tts(reply, voice_id=voice_name)
+        # 3. Speak via local Python TTS
+        speak_with_python_tts(reply, voice_id=voice_name)
 
 
 class ContinuousRecorder:
@@ -665,39 +694,63 @@ class ContinuousRecorder:
             self.p = None
 
 
-def transcribe_audio(recognizer, audio_data):
-    """Convert recorded AudioData to text via Google Speech Recognition."""
+def transcribe_audio(audio_data, whisper_model=None, language=DEFAULT_WHISPER_LANGUAGE, recognizer=None):
+    """
+    Convert recorded AudioData to text using OpenAI Whisper (offline, robust for rap & music).
+    Falls back to Google Speech Recognition if Whisper is unavailable.
+    """
     if not audio_data:
         return None
-    try:
-        print("⚡ Transcribing your voice...")
-        text = recognizer.recognize_google(audio_data)
-        return text.strip()
-    except sr.UnknownValueError:
-        print("🤔 (Could not understand audio or no speech detected)")
-        return None
-    except sr.RequestError as e:
-        print(f"⚠️  Speech recognition service error: {e}")
-        return None
-    except Exception as e:
-        print(f"⚠️  Speech error: {e}")
-        return None
+
+    # 1. Primary: OpenAI Whisper
+    if whisper_model is not None:
+        try:
+            print("⚡ Transcribing with OpenAI Whisper...")
+            raw_audio = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
+            audio_array = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+
+            transcribe_kwargs = {
+                "audio": audio_array,
+                "fp16": False,
+            }
+            if language and language.lower() != "auto":
+                transcribe_kwargs["language"] = language
+
+            result = whisper_model.transcribe(**transcribe_kwargs)
+            text = (result.get("text") or "").strip()
+            if text:
+                return text
+            else:
+                print("🤔 (Whisper detected silence or empty audio)")
+                return None
+        except Exception as e:
+            print(f"⚠️  Whisper error: {e}, falling back to Google Speech...")
+
+    # 2. Fallback: Google Speech Recognition
+    if recognizer is not None:
+        try:
+            print("⚡ Transcribing with Google Speech Recognition...")
+            text = recognizer.recognize_google(audio_data)
+            return text.strip()
+        except sr.UnknownValueError:
+            print("🤔 (Could not understand audio or no speech detected)")
+            return None
+        except Exception as e:
+            print(f"⚠️  Speech error: {e}")
+            return None
+
+    return None
 
 
-def grok_start_battle(arduino, osc_client, voice_name, history):
+def groq_start_battle(arduino, osc_client, voice_name, history):
     """
     Called when button on Pin 9 is pressed.
-    Grok says hi, welcomes the user to the battle, and drops the opening freestyle rap bars!
+    Groq says hi, welcomes the user to the battle, and drops the opening freestyle rap bars!
     """
     print("\n🚀 [START BUTTON PIN 9 PRESSED!] Initializing rap battle...")
     if arduino and arduino.is_open:
         update_lcd(arduino, "Machine Entering Stage\nGet ready to rap...")
 
-    url = "https://api.x.ai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROK_API_KEY}",
-        "Content-Type": "application/json"
-    }
     system_prompt = (
         "You are an energetic freestyle rap battle host and opponent MC. "
         "You are dropping the opening bars over a 4/4 boom-bap beat at 96 BPM. "
@@ -712,44 +765,71 @@ def grok_start_battle(arduino, osc_client, voice_name, history):
     )
 
     intro_reply = None
-    try:
-        res = requests.post(
-            url,
-            headers=headers,
-            json={
-                "model": GROK_MODEL,
-                "messages": [{"role": "system", "content": system_prompt}],
-                "max_tokens": 100,
-                "temperature": 1.0
-            },
-            timeout=GROK_TIMEOUT
-        )
-        if res.status_code == 200:
-            intro_reply = res.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"⚠️  Grok start error: {e}")
+
+    # 1. Primary: Groq LPU API
+    if GROQ_API_KEY:
+        try:
+            groq_url = "https://api.groq.com/openai/v1/chat/completions"
+            groq_headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            res = requests.post(
+                groq_url,
+                headers=groq_headers,
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [{"role": "system", "content": system_prompt}],
+                    "max_tokens": 80,
+                    "temperature": 0.85
+                },
+                timeout=GROQ_TIMEOUT
+            )
+            if res.status_code == 200:
+                intro_reply = res.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"⚠️  Groq start error: {e}")
+
+    # 2. Fallback: xAI Grok
+    if not intro_reply and GROK_API_KEY:
+        try:
+            res = requests.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": GROK_MODEL,
+                    "messages": [{"role": "system", "content": system_prompt}],
+                    "max_tokens": 80,
+                    "temperature": 1.0
+                },
+                timeout=GROK_TIMEOUT
+            )
+            if res.status_code == 200:
+                intro_reply = res.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"⚠️  xAI Grok start error: {e}")
 
     if not intro_reply:
         intro_reply = (
-            "Your turn, contestant!"
+            "Your turn, contestant!\n"
             "Finished a line? Flip the switch!"
         )
 
     history.clear()
     history.append({"role": "assistant", "content": intro_reply})
 
-    print(f"\n🔥 Grok Intro:\n{intro_reply}\n")
+    print(f"\n🔥 Machine (Groq) Intro:\n{intro_reply}\n")
 
     # 1. Update LCD screen (auto-scrolls)
     if arduino and arduino.is_open:
-        update_lcd(arduino, f"Grok: {intro_reply}")
+        update_lcd(arduino, f"Machine: {intro_reply}")
 
     # 2. Broadcast via OSC
     if osc_client:
         osc_client.send_message("/grok/reply", intro_reply)
 
-    # 3. Speak via xAI Grok TTS
-    speak_with_grok_tts(intro_reply, voice_id=voice_name)
+    # 3. Speak via Python TTS
+    speak_with_python_tts(intro_reply, voice_id=voice_name)
 
     if arduino and arduino.is_open:
         update_lcd(arduino, "Your Turn! Finished a line? Flip the switch!")
@@ -757,35 +837,45 @@ def grok_start_battle(arduino, osc_client, voice_name, history):
         play_host_wav("finish_line")
 
 
+grok_start_battle = groq_start_battle
+
+
 
 def main():
-    global BEAT_VOLUME, GROK_VOLUME, UHH_VOLUME, GROK_MODEL
+    global BEAT_VOLUME, GROK_VOLUME, UHH_VOLUME, GROK_MODEL, GROQ_MODEL
 
-    parser = argparse.ArgumentParser(description="Grok AI Voice Rap Battle with Arduino")
-    parser.add_argument("--model", type=str, default=GROK_MODEL, help=f"xAI Grok model (default: {GROK_MODEL}, e.g. grok-3-mini, grok-3)")
-    parser.add_argument("--voice", type=str, default=DEFAULT_VOICE, help=f"xAI TTS voice ID (default: {DEFAULT_VOICE}, e.g. eve, rex, ara, leo)")
+    parser = argparse.ArgumentParser(description="Groq AI Rap Battle with Arduino & Whisper STT")
+    parser.add_argument("--groq-model", type=str, default=GROQ_MODEL, help=f"Groq LLM model (default: {GROQ_MODEL}, e.g. qwen/qwen3.8-27b, openai/gpt-oss-20b)")
+    parser.add_argument("--model", type=str, default=GROK_MODEL, help=f"Fallback xAI Grok model (default: {GROK_MODEL}, e.g. grok-3-mini, grok-3)")
+    parser.add_argument("--voice", type=str, default=DEFAULT_VOICE, help=f"Voice identifier (default: {DEFAULT_VOICE})")
     parser.add_argument("--port", type=str, default=None, help="Serial port for Arduino LCD")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baud rate (default: 9600)")
     parser.add_argument("--phrase-limit", type=int, default=5, help="Max voice phrase recording seconds (default: 5s)")
     parser.add_argument("--beat-volume", type=float, default=BEAT_VOLUME, help=f"Beat audio volume from 0.0 to 1.0+ (default: {BEAT_VOLUME})")
-    parser.add_argument("--grok-volume", type=float, default=GROK_VOLUME, help=f"Grok voice volume from 0.0 to 1.0+ (default: {GROK_VOLUME})")
+    parser.add_argument("--grok-volume", type=float, default=GROK_VOLUME, help=f"Voice volume from 0.0 to 1.0+ (default: {GROK_VOLUME})")
     parser.add_argument("--uhh-volume", type=float, default=UHH_VOLUME, help=f"Uhh sound FX volume from 0.0 to 1.0+ (default: {UHH_VOLUME})")
+    parser.add_argument("--whisper-model", type=str, default=DEFAULT_WHISPER_MODEL, help=f"Whisper model (default: {DEFAULT_WHISPER_MODEL}, e.g. tiny, base, small)")
+    parser.add_argument("--whisper-lang", type=str, default=DEFAULT_WHISPER_LANGUAGE, help=f"Whisper language (default: {DEFAULT_WHISPER_LANGUAGE}, e.g. en, nl)")
     args = parser.parse_args()
 
     BEAT_VOLUME = args.beat_volume
     GROK_VOLUME = args.grok_volume
     UHH_VOLUME = args.uhh_volume
+    GROQ_MODEL = args.groq_model
     GROK_MODEL = args.model
 
     voice_name = args.voice
     explicit_port = args.port
     baud = args.baud
     phrase_limit = args.phrase_limit
+    whisper_model_name = args.whisper_model
+    whisper_lang = args.whisper_lang
 
     print("=" * 60)
-    print("🔥 GROK RAP BATTLE (VOICE + ARDUINO LCD)")
-    print(f"   Model: {GROK_MODEL} | Voice: {voice_name}")
-    print(f"   Volumes: Beat={BEAT_VOLUME} | Grok={GROK_VOLUME} | FX={UHH_VOLUME}")
+    print("🔥 GROQ AI RAP BATTLE (LPU INFERENCE + ARDUINO LCD)")
+    print(f"   LLM: Groq ({GROQ_MODEL}) [Fallback: xAI {GROK_MODEL}]")
+    print(f"   STT: Whisper ({whisper_model_name}, lang: {whisper_lang}) | Audio: Python TTS")
+    print(f"   Volumes: Beat={BEAT_VOLUME} | Voice={GROK_VOLUME} | FX={UHH_VOLUME}")
     print("=" * 60)
 
     # Setup OSC
@@ -802,6 +892,16 @@ def main():
     recorder = ContinuousRecorder()
     atexit.register(recorder.close)
     print("✨ Continuous microphone recorder ready.")
+
+    # Setup OpenAI Whisper Model
+    whisper_model = None
+    if HAS_WHISPER:
+        try:
+            print(f"🤖 Loading OpenAI Whisper model ('{whisper_model_name}')...")
+            whisper_model = whisper.load_model(whisper_model_name)
+            print("✨ Whisper model loaded successfully.")
+        except Exception as e:
+            print(f"⚠️  Could not load Whisper model: {e}")
 
     # Setup Arduino
     print("\n🔌 Connecting to Arduino LCD...")
@@ -1060,7 +1160,12 @@ def main():
                 min_samples = int(16000 * 2 * 0.3)
                 if audio_data and len(audio_data.get_raw_data()) >= min_samples:
                     update_lcd(arduino, "Heard your bars!\nTranscribing...")
-                    user_text = transcribe_audio(recognizer, audio_data)
+                    user_text = transcribe_audio(
+                        audio_data,
+                        whisper_model=whisper_model,
+                        language=whisper_lang,
+                        recognizer=recognizer
+                    )
                     if user_text:
                         handle_rap_interaction(user_text, arduino, osc_client, voice_name, history)
                         print("\n👉 [Your Turn] Flip mic switch ON (Pin 7 or press 'm') to rap again!")
@@ -1098,7 +1203,7 @@ def main():
             if arduino and arduino.is_open:
                 send_to_arduino(arduino, "ALL_OFF")
                 send_to_arduino(arduino, "CLEAR")
-                send_to_arduino(arduino, "LINE:0:Grok Offline")
+                send_to_arduino(arduino, "LINE:0:Groq Offline")
                 arduino.close()
             break
 
