@@ -56,6 +56,9 @@ LCD_ROWS = 4
 OSC_IP = "127.0.0.1"
 OSC_PORT_SEND = 9000
 TTS_AUDIO_FILE = "/tmp/grok_tts_rap.mp3"
+UHH_AUDIO_FILE = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "assets", "uhh.mpeg")
+)
 
 
 def find_arduino_ports():
@@ -163,6 +166,27 @@ def speak_with_grok_tts(text, voice_id=DEFAULT_VOICE):
         subprocess.run(["say", clean], check=False)
     except Exception as e:
         print(f"⚠️  TTS error: {e}")
+
+
+def play_uhh_sound():
+    """Play the assets/uhh.mpeg sound effect when the mic is switched off."""
+    target_file = UHH_AUDIO_FILE
+    if not os.path.exists(target_file):
+        alt = os.path.abspath(os.path.join(os.getcwd(), "assets", "uhh.mpeg"))
+        if os.path.exists(alt):
+            target_file = alt
+        else:
+            print(f"⚠️  Audio file not found: {target_file}")
+            return
+
+    try:
+        print(f"🔊 [Sound FX] Playing {os.path.basename(target_file)}...")
+        if sys.platform == "darwin":
+            subprocess.Popen(["afplay", target_file])
+        else:
+            subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", target_file])
+    except Exception as e:
+        print(f"⚠️  Error playing sound effect: {e}")
 
 
 def ask_grok(user_input, history=None):
@@ -395,11 +419,14 @@ def main():
                         print("\n🔘 [Start Button Pin 9 Pressed]")
                         start_requested = True
                     elif line in ["MIC:ON", "BTN:ON"]:
-                        mic_active = True
-                        print("🟢 [Mic Switch Pin 7: ON]")
+                        if not mic_active:
+                            mic_active = True
+                            print("🟢 [Mic Switch Pin 7: ON]")
                     elif line in ["MIC:OFF", "BTN:OFF"]:
-                        mic_active = False
-                        print("🔴 [Mic Switch Pin 7: OFF]")
+                        if mic_active:
+                            mic_active = False
+                            print("🔴 [Mic Switch Pin 7: OFF]")
+                            play_uhh_sound()
                     elif line.startswith("ACK:"):
                         pass
                     elif line:
