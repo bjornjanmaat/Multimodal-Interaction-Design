@@ -927,7 +927,7 @@ def gemini_start_battle(arduino, osc_client, voice_name, history):
     speak_with_python_tts(intro_reply, voice_id=voice_name)
 
     if arduino and arduino.is_open:
-        update_lcd(arduino, "Your Turn! Finished a line? Flip the switch!")
+        update_lcd(arduino, "Your Turn Contestant! Finished a line? Flip the switch!")
         play_host_wav("your_turn")
         play_host_wav("finish_line")
 
