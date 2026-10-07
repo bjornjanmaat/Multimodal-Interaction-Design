@@ -65,8 +65,7 @@ void renderWindow(int startIdx) {
   }
 }
 
-// Word-wrap any incoming text into lines of up to 20 characters and start
-// scrolling
+// Word-wrap any incoming text into lines of up to 20 characters and start scrolling
 void setText(String text) {
   totalLines = 0;
   currentScrollLine = 0;
@@ -76,33 +75,56 @@ void setText(String text) {
   int charIdx = 0;
 
   while (charIdx < textLen && totalLines < MAX_LINES) {
-    int remaining = textLen - charIdx;
-    if (remaining <= 20) {
-      lines[totalLines++] = text.substring(charIdx);
-      break;
-    } else {
-      // Find the last space within 20 character window for clean word wrapping
-      int splitPos = 20;
-      int lastSpace = -1;
-      for (int i = 0; i < 20; i++) {
-        if (text.charAt(charIdx + i) == ' ') {
-          lastSpace = i;
+    // Check if there is an explicit newline delimiter '|'
+    int nextPipe = text.indexOf('|', charIdx);
+    int segEnd = (nextPipe != -1) ? nextPipe : textLen;
+    String segment = text.substring(charIdx, segEnd);
+    segment.trim();
+
+    if (segment.length() == 0) {
+      charIdx = segEnd + 1;
+      continue; // Skip empty segments to avoid blank lines
+    }
+
+    int segLen = segment.length();
+    int segIdx = 0;
+
+    // Word wrap this segment into lines of up to 20 chars
+    while (segIdx < segLen && totalLines < MAX_LINES) {
+      int remaining = segLen - segIdx;
+      if (remaining <= 20) {
+        String lastLine = segment.substring(segIdx);
+        lastLine.trim();
+        if (lastLine.length() > 0) {
+          lines[totalLines++] = lastLine;
+        }
+        break;
+      } else {
+        int splitPos = 20;
+        int lastSpace = -1;
+        for (int i = 0; i < 20; i++) {
+          if (segment.charAt(segIdx + i) == ' ') {
+            lastSpace = i;
+          }
+        }
+        if (lastSpace > 0) {
+          splitPos = lastSpace;
+        }
+
+        String rowText = segment.substring(segIdx, segIdx + splitPos);
+        rowText.trim();
+        if (rowText.length() > 0) {
+          lines[totalLines++] = rowText;
+        }
+
+        segIdx += splitPos;
+        while (segIdx < segLen && segment.charAt(segIdx) == ' ') {
+          segIdx++;
         }
       }
-      if (lastSpace > 3) {
-        splitPos = lastSpace;
-      }
-
-      String rowText = text.substring(charIdx, charIdx + splitPos);
-      rowText.trim();
-      lines[totalLines++] = rowText;
-
-      charIdx += splitPos;
-      // Skip leading spaces on the next line
-      while (charIdx < textLen && text.charAt(charIdx) == ' ') {
-        charIdx++;
-      }
     }
+
+    charIdx = segEnd + 1;
   }
 
   isScrolling = (totalLines > 4);

@@ -50,7 +50,6 @@ except ImportError:
     print("pyserial is required. Install with: pip3 install pyserial")
     sys.exit(1)
 
-
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
@@ -122,27 +121,31 @@ def send_to_arduino(arduino, command):
 
 
 def format_text_for_lcd(text, max_cols=LCD_COLS, max_rows=LCD_ROWS):
-    """Wrap text into lines of up to 20 characters."""
-    wrapped = textwrap.wrap(text.strip(), width=max_cols)
+    """Wrap text into clean lines of up to 20 characters, respecting newlines and removing blank lines."""
+    raw_lines = text.strip().split("\n")
+    wrapped = []
+    for rl in raw_lines:
+        rl_clean = " ".join(rl.strip().split())
+        if not rl_clean:
+            continue
+        w = textwrap.wrap(rl_clean, width=max_cols)
+        wrapped.extend(w)
     if not wrapped:
         wrapped = [""]
-    if len(wrapped) > max_rows:
-        wrapped = wrapped[-max_rows:]
-    while len(wrapped) < max_rows:
-        wrapped.append("")
     return wrapped
 
 
 def update_lcd(arduino, text):
-    """Format and send full text to Arduino LCD (triggers auto-scrolling)."""
+    """Format and send full text to Arduino LCD (triggers auto-scrolling if > 4 lines)."""
     lines = format_text_for_lcd(text)
     print("┌" + "─" * LCD_COLS + "┐")
-    for line in lines:
-        padded = line[:LCD_COLS]
+    for r in range(LCD_ROWS):
+        line_content = lines[r] if r < len(lines) else ""
+        padded = line_content[:LCD_COLS]
         print(f"│{padded.ljust(LCD_COLS)}│")
     print("└" + "─" * LCD_COLS + "┘")
-    clean_text = " ".join(text.strip().split())
-    send_to_arduino(arduino, f"TEXT:{clean_text}")
+    clean_message = "|".join(lines)
+    send_to_arduino(arduino, f"TEXT:{clean_message}")
 
 
 def speak_with_grok_tts(text, voice_id=DEFAULT_VOICE, volume=None):
@@ -328,12 +331,14 @@ def ask_grok(user_input, history=None):
 def handle_rap_interaction(prompt, arduino, osc_client, voice_name, history):
     """Send user input to Grok, display on LCD, and play voice."""
     print(f"\n🎤 Heard: \"{prompt}\"")
-    if arduino and arduino.is_open:
-        update_lcd(arduino, f"You: {prompt}")
+    prompt_clean = " ".join(prompt.strip().split())
+    if len(prompt_clean) > 36:
+        prompt_display = prompt_clean[:33] + "..."
+    else:
+        prompt_display = prompt_clean
 
     print("\n🤖 Grok is writing bars in response...")
-    if arduino and arduino.is_open:
-        send_to_arduino(arduino, "LINE:3:Grok thinking...")
+    update_lcd(arduino, f"You: {prompt_display}\nGrok thinking...")
 
     reply = ask_grok(prompt, history)
     if reply:
