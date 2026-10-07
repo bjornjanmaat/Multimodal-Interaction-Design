@@ -1,71 +1,52 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   Send,
   CheckCircle2,
   AlertCircle,
-  RefreshCw
+  RefreshCw,
+  Bot,
+  User,
+  Trophy
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { supabase, isConfigured } from './supabaseClient';
 import { playVoteSound } from './utils/audio';
 import './App.css';
 
-const RATING_DESCRIPTIONS = {
-  1: { label: 'Poor' },
-  2: { label: 'Fair' },
-  3: { label: 'Average' },
-  4: { label: 'Good' },
-  5: { label: 'Exceptional!' }
-};
+const CHOICES = [
+  {
+    id: 'machine',
+    label: 'Machine',
+    subtitle: 'AI Rapper',
+    icon: Bot,
+    tag: 'Machine'
+  },
+  {
+    id: 'man',
+    label: 'Man',
+    subtitle: 'Human MC',
+    icon: User,
+    tag: 'Man'
+  }
+];
 
 export default function App() {
-  const [selectedRating, setSelectedRating] = useState(null);
-  const [hoverRating, setHoverRating] = useState(null);
+  const [selectedWinner, setSelectedWinner] = useState(null);
+  const [hoverWinner, setHoverWinner] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitSuccess, setSubmitSuccess] = useState(null);
   const [errorMessage, setErrorMessage] = useState('');
-  const [stats, setStats] = useState({ total: 0, average: null });
 
-  // Fetch quick stats from public.ratings if Supabase is connected
-  const fetchStats = async () => {
-    if (!supabase) return;
-    try {
-      const { data, error } = await supabase
-        .from('ratings')
-        .select('rating');
-
-      if (error) throw error;
-
-      if (data && data.length > 0) {
-        const total = data.length;
-        const sum = data.reduce((acc, curr) => acc + Number(curr.rating || 0), 0);
-        const avg = (sum / total).toFixed(1);
-        setStats({ total, average: avg });
-      } else {
-        setStats({ total: 0, average: null });
-      }
-    } catch (err) {
-      console.warn('Could not fetch stats:', err.message);
-    }
-  };
-
-  useEffect(() => {
-    if (isConfigured) {
-      fetchStats();
-    }
-  }, []);
-
-  const handleRatingSelect = (rating) => {
-    setSelectedRating(rating);
+  const handleSelectWinner = (winnerId) => {
+    setSelectedWinner(winnerId);
     setErrorMessage('');
-    setSubmitSuccess(null);
     playVoteSound();
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!selectedRating) {
-      setErrorMessage('Please select a rating between 1 and 5.');
+    if (!selectedWinner) {
+      setErrorMessage("Please pick either 'machine' or 'man'.");
       return;
     }
 
@@ -80,43 +61,41 @@ export default function App() {
     try {
       const { error } = await supabase
         .from('ratings')
-        .insert([{ rating: selectedRating }]);
+        .insert([{ winner: selectedWinner }]);
 
       if (error) throw error;
 
-      setSubmitSuccess(selectedRating);
+      const votedFor = selectedWinner;
+      setSubmitSuccess(votedFor);
       playVoteSound();
 
       try {
         confetti({
-          particleCount: 50,
-          spread: 60,
+          particleCount: 55,
+          spread: 65,
           origin: { y: 0.65 },
-          colors: ['#111827', '#6b7280', '#9ca3af', '#d1d5db']
+          colors: votedFor === 'machine' ? ['#0284c7', '#38bdf8', '#0f172a'] : ['#f59e0b', '#fbbf24', '#111827']
         });
-      } catch (e) { }
-
-      fetchStats();
+      } catch { }
     } catch (err) {
       console.error('Submission failed:', err);
-      setErrorMessage(err.message || 'Failed to submit rating to Supabase.');
+      setErrorMessage(err.message || 'Failed to submit vote to Supabase.');
     } finally {
       setIsSubmitting(false);
     }
   };
 
   const handleReset = () => {
-    setSelectedRating(null);
+    setSelectedWinner(null);
     setSubmitSuccess(null);
     setErrorMessage('');
   };
 
-  const activeDisplayRating = hoverRating || selectedRating;
-  const currentDetails = activeDisplayRating ? RATING_DESCRIPTIONS[activeDisplayRating] : null;
+  const activeWinner = hoverWinner || selectedWinner;
+  const activeChoice = CHOICES.find((c) => c.id === activeWinner);
 
   return (
     <div className="rating-app-container">
-      {/* Main Container */}
       <main className="rating-main">
         {/* Warning if .env is missing */}
         {!isConfigured && (
@@ -132,123 +111,127 @@ export default function App() {
         )}
 
         <div className="rating-card">
-          <h1 className="rating-title">Rate the Rap</h1>
-          {/* <p className="rating-subtitle">
-            Choose a score from 1 to 5.
-          </p> */}
+          <div className="badge-header">
+            <Trophy size={16} />
+            <span>Rap Battle Vote</span>
+          </div>
+
+          <h1 className="rating-title">Who Won the Battle?</h1>
+          <p className="rating-subtitle">
+            Choose who had the best flow and bars: the Machine or the Man.
+          </p>
 
           {/* Feedback Label Banner */}
           <div className="rating-feedback-display">
-            {currentDetails ? (
+            {activeChoice ? (
               <div className="feedback-pill">
-                <span className="feedback-score mono-num">{activeDisplayRating} / 5</span>
-                <span className="feedback-text">— {currentDetails.label}</span>
+                <span className="feedback-score">{activeChoice.label}</span>
+                <span className="feedback-text">— {activeChoice.subtitle}</span>
               </div>
             ) : (
-              <span className="feedback-placeholder">Select a score from 1 to 5</span>
+              <span className="feedback-placeholder">Select a contender below</span>
             )}
           </div>
 
-          {/* 1 - 5 Rating Buttons */}
-          <div className="rating-buttons-grid" role="radiogroup" aria-label="Rating 1 to 5">
-            {[1, 2, 3, 4, 5].map((num) => {
-              const isSelected = selectedRating === num;
-
-              return (
-                <button
-                  key={num}
-                  id={`rating-btn-${num}`}
-                  type="button"
-                  className={`rating-number-btn ${isSelected ? 'selected' : ''}`}
-                  onClick={() => handleRatingSelect(num)}
-                  onMouseEnter={() => setHoverRating(num)}
-                  onMouseLeave={() => setHoverRating(null)}
-                  disabled={isSubmitting}
-                  aria-checked={isSelected}
-                  role="radio"
-                >
-                  <span className="number-label mono-num">{num}</span>
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Anchors */}
-          {/* <div className="scale-anchors">
-            <span>1 (Poor)</span>
-            <span>3 (Average)</span>
-            <span>5 (Exceptional)</span>
-          </div> */}
-
-          {/* Error Message */}
-          {errorMessage && (
-            <div className="alert-box error" id="error-message">
-              <AlertCircle size={18} />
-              <span>{errorMessage}</span>
-            </div>
-          )}
-
-          {/* Success Message Banner */}
-          {/* {submitSuccess !== null && (
-            <div className="alert-box success" id="success-message">
-              <CheckCircle2 size={20} />
-              <div>
-                <strong>Rating of {submitSuccess}/5 saved!</strong>
-                <p>Recorded to Supabase table <code>public.ratings</code>.</p>
+          {/* Success State or Selection Grid */}
+          {submitSuccess !== null ? (
+            <div className="vote-success-view">
+              <div className="success-icon-wrap">
+                <CheckCircle2 size={42} className="success-check-icon" />
               </div>
-            </div>
-          )} */}
+              <h2 className="success-title">Vote Recorded!</h2>
+              <p className="success-desc">
+                You voted for <strong>{submitSuccess === 'machine' ? 'Machine' : 'Man'}</strong>. Your vote has been saved to Supabase.
+              </p>
 
-          {/* Actions */}
-          <div className="rating-actions">
-            {submitSuccess !== null ? (
               <button
                 type="button"
-                id="rate-again-btn"
+                id="vote-again-btn"
                 className="btn-submit btn-secondary-action"
                 onClick={handleReset}
               >
                 <RefreshCw size={18} />
-                <span>Submit Another Rating</span>
+                <span>Vote Again</span>
               </button>
-            ) : (
-              <button
-                type="button"
-                id="submit-rating-btn"
-                className="btn-submit"
-                onClick={handleSubmit}
-                disabled={isSubmitting || !selectedRating}
+            </div>
+          ) : (
+            <>
+              {/* Machine or Man Choice Buttons */}
+              <div
+                className="winner-selection-grid"
+                role="radiogroup"
+                aria-label="Pick winner: Machine or Man"
               >
-                {isSubmitting ? (
-                  <>
-                    <RefreshCw size={18} className="spinner" />
-                    <span>Saving...</span>
-                  </>
-                ) : (
-                  <>
-                    <Send size={18} />
-                    <span>Submit</span>
-                  </>
-                )}
-              </button>
-            )}
-          </div>
-        </div>
+                {CHOICES.map((choice) => {
+                  const isSelected = selectedWinner === choice.id;
+                  const IconComponent = choice.icon;
 
-        {/* Aggregate Stats */}
-        {/* {isConfigured && stats.total > 0 && (
-          <div className="stats-panel">
-            <div className="stat-item">
-              <span className="stat-num mono-num">{stats.average}</span>
-              <span>average</span>
-            </div>
-            <span className="stat-divider">•</span>
-            <div className="stat-item">
-              <span className="stat-num mono-num">{stats.total}</span>
-              <span>total ratings</span>
-            </div>
-          </div>
-        )} */}
+                  return (
+                    <button
+                      key={choice.id}
+                      id={`winner-btn-${choice.id}`}
+                      type="button"
+                      className={`winner-card-btn ${isSelected ? 'selected' : ''} ${choice.id}-card`}
+                      onClick={() => handleSelectWinner(choice.id)}
+                      onMouseEnter={() => setHoverWinner(choice.id)}
+                      onMouseLeave={() => setHoverWinner(null)}
+                      disabled={isSubmitting}
+                      aria-checked={isSelected}
+                      role="radio"
+                    >
+                      <div className="card-top-row">
+                        <span className="choice-tag">{choice.tag}</span>
+                        {isSelected && <span className="selection-indicator">✓</span>}
+                      </div>
+
+                      <div className="card-icon-wrapper">
+                        <IconComponent size={38} strokeWidth={1.8} />
+                      </div>
+
+                      <span className="choice-label">{choice.label}</span>
+                      <span className="choice-subtitle">{choice.subtitle}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Error Message */}
+              {errorMessage && (
+                <div className="alert-box error" id="error-message">
+                  <AlertCircle size={18} />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+
+              {/* Submit Action */}
+              <div className="rating-actions">
+                <button
+                  type="button"
+                  id="submit-vote-btn"
+                  className="btn-submit"
+                  onClick={handleSubmit}
+                  disabled={isSubmitting || !selectedWinner}
+                >
+                  {isSubmitting ? (
+                    <>
+                      <RefreshCw size={18} className="spinner" />
+                      <span>Submitting...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Send size={18} />
+                      <span>
+                        {selectedWinner
+                          ? `Vote for ${selectedWinner === 'machine' ? 'Machine' : 'Man'}`
+                          : 'Submit Vote'}
+                      </span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
       </main>
     </div>
   );

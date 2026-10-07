@@ -65,8 +65,8 @@ def get_supabase_credentials():
 
 
 def fetch_ratings_and_average(url, key):
-    """Fetch all rows from public.ratings and calculate average score."""
-    endpoint = f"{url}/rest/v1/ratings?select=rating"
+    """Fetch all rows from public.ratings and calculate vote ratio."""
+    endpoint = f"{url}/rest/v1/ratings?select=winner"
     headers = {
         "apikey": key,
         "Authorization": f"Bearer {key}"
@@ -77,20 +77,16 @@ def fetch_ratings_and_average(url, key):
         response.raise_for_status()
         data = response.json()
 
-        if not data:
-            return 0, 0.0
+        total = len(data)
+        machine_count = sum(1 for item in data if (item.get("winner") or "").strip().lower() in ("machine", "bot"))
+        man_count = sum(1 for item in data if (item.get("winner") or "").strip().lower() in ("man", "person"))
+        machine_ratio = (machine_count / total) if total > 0 else 0.0
 
-        scores = [int(item["rating"]) for item in data if item.get("rating") is not None]
-        if not scores:
-            return 0, 0.0
-
-        total = len(scores)
-        avg = sum(scores) / total
-        return total, avg
+        return total, machine_count, man_count, machine_ratio
 
     except requests.RequestException as e:
         print(f"⚠️  Supabase fetch error: {e}")
-        return None, None
+        return None, None, None, None
 
 
 def try_connect_arduino(explicit_port=None, baud=9600):
@@ -171,49 +167,49 @@ def main():
                         send_to_arduino(arduino, f"LEVEL:{last_rounded_avg}")
 
             # 2. Fetch latest scores from Supabase
-            total, avg = fetch_ratings_and_average(url, key)
+            total, machine_count, man_count, machine_ratio = fetch_ratings_and_average(url, key)
 
             if total is not None:
-                rounded_avg = max(0, min(5, round(avg))) if total > 0 else 0
+                rounded_level = max(0, min(5, round(machine_ratio * 5))) if total > 0 else 0
 
                 # Initial fetch
                 if last_total is None:
                     last_total = total
-                    last_rounded_avg = rounded_avg
-                    send_to_arduino(arduino, f"LEVEL:{rounded_avg}")
-                    active_pins = [f"Pin {p}" for p in range(2, 2 + rounded_avg)]
+                    last_rounded_avg = rounded_level
+                    send_to_arduino(arduino, f"LEVEL:{rounded_level}")
+                    active_pins = [f"Pin {p}" for p in range(2, 2 + rounded_level)]
                     pins_str = ", ".join(active_pins) if active_pins else "None"
-                    print(f" Initial State: {total} votes | Average: {avg:.2f}/5.00 → LEDs: Level {rounded_avg}/5 ({pins_str})")
+                    print(f" Initial State: {total} votes (Machine: {machine_count}, Man: {man_count}) | Machine share: {machine_ratio * 100:.0f}% → LEDs: Level {rounded_level}/5 ({pins_str})")
 
                 else:
                     # Check if new votes arrived
                     if total > last_total:
                         diff = total - last_total
-                        print(f"\n🗳️  [NEW VOTE] +{diff} new vote(s) received! (Total: {total})")
+                        print(f"\n🗳️  [NEW VOTE] +{diff} new vote(s) received! (Total: {total} | Machine: {machine_count}, Man: {man_count})")
                         # Send count so Arduino beeps once per new vote
                         send_to_arduino(arduino, f"NEW_VOTE:{diff}")
                         # Allow time for beeps to complete (160ms tone + 90ms gap = ~250ms each)
                         time.sleep(diff * 0.26)
 
-                    # Check if rounded average changed
-                    if rounded_avg > last_rounded_avg:
-                        print(f"📈 [AVERAGE UP] Level went up: {last_rounded_avg} → {rounded_avg} (Exact average: {avg:.2f}/5.00)")
+                    # Check if machine level changed
+                    if rounded_level > last_rounded_avg:
+                        print(f"📈 [RATIO SHIFT] Machine share went up: Level {last_rounded_avg} → {rounded_level} ({machine_ratio * 100:.0f}% Machine)")
                         send_to_arduino(arduino, "AVG_UP")
                         time.sleep(0.2)
-                        send_to_arduino(arduino, f"LEVEL:{rounded_avg}")
+                        send_to_arduino(arduino, f"LEVEL:{rounded_level}")
 
-                    elif rounded_avg < last_rounded_avg:
-                        print(f"📉 [AVERAGE DOWN] Level went down: {last_rounded_avg} → {rounded_avg} (Exact average: {avg:.2f}/5.00)")
+                    elif rounded_level < last_rounded_avg:
+                        print(f"📉 [RATIO SHIFT] Machine share went down: Level {last_rounded_avg} → {rounded_level} ({machine_ratio * 100:.0f}% Machine)")
                         send_to_arduino(arduino, "AVG_DOWN")
                         time.sleep(0.2)
-                        send_to_arduino(arduino, f"LEVEL:{rounded_avg}")
+                        send_to_arduino(arduino, f"LEVEL:{rounded_level}")
 
                     elif total > last_total:
-                        # Average remained the same, but still refresh LED level just in case
-                        send_to_arduino(arduino, f"LEVEL:{rounded_avg}")
+                        # Share remained the same, but still refresh LED level just in case
+                        send_to_arduino(arduino, f"LEVEL:{rounded_level}")
 
                     last_total = total
-                    last_rounded_avg = rounded_avg
+                    last_rounded_avg = rounded_level
 
             # Read any serial responses from Arduino (non-blocking)
             try:
