@@ -20,6 +20,88 @@ unsigned long lastStartDebounce = 0;
 
 const unsigned long DEBOUNCE_DELAY = 50;
 
+// ---------------- LED Vote Partition Configuration ----------------
+// Man Party: Pins 4, 5, 6
+// Machine (Grok) Party: Pins 10, 11, 12
+const int MAN_PINS[] = {4, 5, 6};
+const int MACHINE_PINS[] = {10, 11, 12};
+const int LEDS_PER_PARTY = 3;
+
+int currentManLeds = 0;
+int currentMachineLeds = 0;
+
+void setManLeds(int count) {
+  count = constrain(count, 0, LEDS_PER_PARTY);
+  currentManLeds = count;
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    digitalWrite(MAN_PINS[i], (i < count) ? HIGH : LOW);
+  }
+}
+
+void setMachineLeds(int count) {
+  count = constrain(count, 0, LEDS_PER_PARTY);
+  currentMachineLeds = count;
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    digitalWrite(MACHINE_PINS[i], (i < count) ? HIGH : LOW);
+  }
+}
+
+void setPartyLeds(int manCount, int machineCount) {
+  setManLeds(manCount);
+  setMachineLeds(machineCount);
+}
+
+void calculatePartition(int manVotes, int machineVotes, int &manLeds, int &machineLeds) {
+  int total = manVotes + machineVotes;
+  if (total <= 0) {
+    manLeds = 0;
+    machineLeds = 0;
+    return;
+  }
+  if (machineVotes == 0) {
+    manLeds = 3;
+    machineLeds = 0;
+    return;
+  }
+  if (manVotes == 0) {
+    manLeds = 0;
+    machineLeds = 3;
+    return;
+  }
+  float manShare = (float)manVotes / (float)total;
+  float machineShare = (float)machineVotes / (float)total;
+  manLeds = round(manShare * 3.0);
+  machineLeds = round(machineShare * 3.0);
+  if (manVotes > 0 && manLeds < 1) manLeds = 1;
+  if (machineVotes > 0 && machineLeds < 1) machineLeds = 1;
+  manLeds = constrain(manLeds, 0, 3);
+  machineLeds = constrain(machineLeds, 0, 3);
+}
+
+void updatePartition(int manVotes, int machineVotes) {
+  int manLeds = 0;
+  int machineLeds = 0;
+  calculatePartition(manVotes, machineVotes, manLeds, machineLeds);
+  setPartyLeds(manLeds, machineLeds);
+  Serial.print("LEDS_PARTITION: Man=");
+  Serial.print(manLeds);
+  Serial.print("/3, Machine=");
+  Serial.print(machineLeds);
+  Serial.println("/3");
+}
+
+void pulseNewVote(int count = 1) {
+  if (count < 1) count = 1;
+  for (int c = 0; c < count; c++) {
+    int savedMan = currentManLeds;
+    int savedMachine = currentMachineLeds;
+    setPartyLeds(0, 0);
+    delay(70);
+    setPartyLeds(savedMan, savedMachine);
+    if (c < count - 1) delay(100);
+  }
+}
+
 // Helper function to write a full 20-char line, padding remaining characters
 // with spaces
 void writeRow(int row, String text) {
@@ -139,6 +221,14 @@ void setup() {
   pinMode(MIC_SWITCH_PIN, INPUT_PULLUP);
   pinMode(START_BUTTON_PIN, INPUT_PULLUP);
 
+  // Initialize LED output pins (Man: 4, 5, 6 | Machine: 10, 11, 12)
+  for (int i = 0; i < LEDS_PER_PARTY; i++) {
+    pinMode(MAN_PINS[i], OUTPUT);
+    digitalWrite(MAN_PINS[i], LOW);
+    pinMode(MACHINE_PINS[i], OUTPUT);
+    digitalWrite(MACHINE_PINS[i], LOW);
+  }
+
   lcd.init();      // Initialize the LCD
   lcd.backlight(); // Turn on backlight
 
@@ -231,6 +321,37 @@ void loop() {
       } else if (msg.startsWith("TEXT:")) {
         setText(msg.substring(5));
         Serial.println("ACK:TEXT_UPDATED");
+      } else if (msg.startsWith("VOTES:")) {
+        int commaIdx = msg.indexOf(',');
+        if (commaIdx != -1) {
+          int manVotes = msg.substring(6, commaIdx).toInt();
+          int machineVotes = msg.substring(commaIdx + 1).toInt();
+          updatePartition(manVotes, machineVotes);
+          Serial.println("ACK:VOTES_SET");
+        }
+      } else if (msg.startsWith("LEDS:") || msg.startsWith("PARTITION:")) {
+        int colonIdx = msg.indexOf(':');
+        int commaIdx = msg.indexOf(',');
+        if (commaIdx != -1) {
+          int manLeds = msg.substring(colonIdx + 1, commaIdx).toInt();
+          int machineLeds = msg.substring(commaIdx + 1).toInt();
+          setPartyLeds(manLeds, machineLeds);
+          Serial.println("ACK:LEDS_SET");
+        }
+      } else if (msg.startsWith("NEW_VOTE")) {
+        int count = 1;
+        int colonIdx = msg.indexOf(':');
+        if (colonIdx != -1) {
+          count = msg.substring(colonIdx + 1).toInt();
+        }
+        pulseNewVote(count);
+        Serial.println("ACK:NEW_VOTE_PULSED");
+      } else if (msg.equalsIgnoreCase("ALL_OFF") || msg.equalsIgnoreCase("LEDS_OFF")) {
+        setPartyLeds(0, 0);
+        Serial.println("ACK:LEDS_OFF");
+      } else if (msg.equalsIgnoreCase("ALL_ON") || msg.equalsIgnoreCase("LEDS_ON")) {
+        setPartyLeds(3, 3);
+        Serial.println("ACK:LEDS_ON");
       } else {
         // Raw string fallback
         setText(msg);

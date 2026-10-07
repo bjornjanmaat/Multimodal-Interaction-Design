@@ -23,6 +23,7 @@ import threading
 import subprocess
 import atexit
 import select
+import random
 try:
     import termios
     import tty
@@ -31,11 +32,16 @@ except ImportError:
     HAS_TERMIOS = False
 import requests
 import speech_recognition as sr
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
 from dotenv import load_dotenv
 
-# Load .env (looking for GROK_API_KEY)
+# Load .env (looking for GROK_API_KEY and Supabase credentials)
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", "vote_app", ".env"))
 load_dotenv()
 
 try:
@@ -54,7 +60,8 @@ except ImportError:
 # CONFIGURATION
 # -----------------------------
 GROK_API_KEY = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
-GROK_MODEL = "grok-3"
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-3-mini")
+GROK_TIMEOUT = int(os.getenv("GROK_TIMEOUT", "20"))
 DEFAULT_VOICE = "eve"          # xAI voice ID (e.g. eve, rex, ara, leo)
 DEFAULT_BAUD = 9600
 LCD_COLS = 20
@@ -69,12 +76,24 @@ BEAT_AUDIO_FILE = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "assets", "beat.mpeg")
 )
 
+# Supabase Vote Configuration (for 6-LED Vote Partition)
+SUPABASE_URL = (os.getenv("VITE_SUPABASE_URL") or os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY = os.getenv("VITE_SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY")
+
 # -----------------------------
 # AUDIO VOLUME CONFIGURATION (0.0 to 1.0+)
 # -----------------------------
 BEAT_VOLUME = float(os.getenv("BEAT_VOLUME", "0.35"))   # Rap beat backing track volume
 GROK_VOLUME = float(os.getenv("GROK_VOLUME", "1.0"))    # Grok battle bars voice volume
 UHH_VOLUME = float(os.getenv("UHH_VOLUME", "0.6"))      # 'Uhh' ad-lib sound effect volume
+
+# Render the Klattsch clips with these exact filenames.
+HOST_WAV_FILES = {
+    "ready": "../assets/01_ready_to_battle.wav",
+    "your_turn": "../assets/02_your_turn_contestant.wav",
+    "finish_line": "../assets/03_finished_line_flip_switch.wav",
+    "round_end": "../assets/04_round_was_fire_votes.wav",
+}
 
 
 def find_arduino_ports():
@@ -189,6 +208,26 @@ def speak_with_grok_tts(text, voice_id=DEFAULT_VOICE, volume=None):
     except Exception as e:
         print(f"⚠️  TTS error: {e}")
 
+def play_host_wav(cue_name):
+    """Play one pre-rendered Klattsch host line, blocking until it ends."""
+    filename = HOST_WAV_FILES.get(cue_name)
+    if not filename:
+        print(f"⚠️  Unknown Klattsch cue: {cue_name}")
+        return False
+
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), filename))
+    if not os.path.isfile(path):
+        print(f"🔇 Klattsch cue '{cue_name}' not found yet: {path}")
+        return False
+
+    try:
+        print(f"🗣️  Klattsch host: {filename}")
+        subprocess.run(["afplay", path], check=False)
+        return True
+    except Exception as error:
+        print(f"⚠️  Could not play Klattsch WAV '{filename}': {error}")
+        return False
+
 
 def play_uhh_sound(volume=None):
     """Play the assets/uhh.mpeg sound effect when the mic is switched off."""
@@ -279,6 +318,170 @@ def stop_beat_loop():
 atexit.register(stop_beat_loop)
 
 
+# -----------------------------
+# SUPABASE VOTE & LED MONITOR (PINS 4,5,6 & 10,11,12)
+# -----------------------------
+voting_thread = None
+voting_stop_event = threading.Event()
+
+
+def fetch_supabase_votes(url=None, key=None):
+    """Fetch all rows from Supabase public.ratings and return vote counts."""
+    target_url = (url or SUPABASE_URL or "").rstrip("/")
+    target_key = key or SUPABASE_KEY
+    if not target_url or not target_key:
+        return None, 0, 0, 0.0
+
+    endpoint = f"{target_url}/rest/v1/ratings?select=winner"
+    headers = {
+        "apikey": target_key,
+        "Authorization": f"Bearer {target_key}"
+    }
+
+    try:
+        response = requests.get(endpoint, headers=headers, timeout=4)
+        if response.status_code == 200:
+            data = response.json()
+            total = len(data)
+            machine_count = sum(1 for item in data if (item.get("winner") or "").strip().lower() in ("machine", "bot"))
+            man_count = sum(1 for item in data if (item.get("winner") or "").strip().lower() in ("man", "person"))
+            machine_ratio = (machine_count / total) if total > 0 else 0.0
+            return total, machine_count, man_count, machine_ratio
+        else:
+            print(f"⚠️  Supabase ratings endpoint returned {response.status_code}")
+    except requests.RequestException as e:
+        print(f"⚠️  Supabase fetch error: {e}")
+
+    return None, 0, 0, 0.0
+
+
+def compute_partition_leds(man_votes, machine_votes):
+    """
+    Calculate 0-3 LED partition for Man (pins 4, 5, 6) and Machine (pins 10, 11, 12).
+    - If a party has 0 votes, 0 LEDs.
+    - If 100% of votes, 3 LEDs.
+    - If both have votes, proportional partition rounded to 0-3 with at least 1 LED.
+    """
+    total = man_votes + machine_votes
+    if total <= 0:
+        return 0, 0
+    if machine_votes == 0:
+        return 3, 0
+    if man_votes == 0:
+        return 0, 3
+
+    man_share = man_votes / total
+    machine_share = machine_votes / total
+
+    man_leds = round(man_share * 3.0)
+    machine_leds = round(machine_share * 3.0)
+
+    if man_votes > 0 and man_leds < 1:
+        man_leds = 1
+    if machine_votes > 0 and machine_leds < 1:
+        machine_leds = 1
+
+    return max(0, min(3, int(man_leds))), max(0, min(3, int(machine_leds)))
+
+
+def trigger_round_vote_leds(arduino, osc_client=None):
+    """
+    Fetch votes from Supabase, display formatted results,
+    light up the LEDs on Arduino pins 4,5,6 and 10,11,12,
+    and broadcast over OSC.
+    """
+    total, machine_count, man_count, _ = fetch_supabase_votes()
+    if total is None:
+        total, machine_count, man_count = 0, 0, 0
+
+    man_leds, machine_leds = compute_partition_leds(man_count, machine_count)
+
+    print("\n" + "═" * 58)
+    print("🗳️  SUPABASE VOTE RESULTS & LED PARTITION")
+    print(f"   Total Votes: {total}")
+    man_pins = [f"Pin {p}" for p in [4, 5, 6][:man_leds]] or ["All OFF"]
+    machine_pins = [f"Pin {p}" for p in [10, 11, 12][:machine_leds]] or ["All OFF"]
+    print(f"   🧑 Man:     {man_count} votes → {man_leds}/3 LEDs ({', '.join(man_pins)})")
+    print(f"   🤖 Machine: {machine_count} votes → {machine_leds}/3 LEDs ({', '.join(machine_pins)})")
+    print("═" * 58 + "\n")
+
+    if arduino and arduino.is_open:
+        send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
+
+    if osc_client:
+        try:
+            osc_client.send_message("/battle/votes", f"{man_count},{machine_count},{man_leds},{machine_leds}")
+        except Exception:
+            pass
+
+    return total, man_count, machine_count, man_leds, machine_leds
+
+
+def start_vote_polling(arduino, osc_client=None, poll_interval=1.5):
+    """Start background thread to dynamically poll Supabase votes and update LEDs."""
+    global voting_thread, voting_stop_event
+    stop_vote_polling()
+    voting_stop_event.clear()
+
+    def _poll_loop():
+        last_total = None
+        last_man_leds = None
+        last_machine_leds = None
+
+        while not voting_stop_event.is_set():
+            total, machine_count, man_count, _ = fetch_supabase_votes()
+            if total is not None:
+                man_leds, machine_leds = compute_partition_leds(man_count, machine_count)
+                if last_total is None:
+                    last_total = total
+                    last_man_leds = man_leds
+                    last_machine_leds = machine_leds
+                    if arduino and arduino.is_open:
+                        send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
+                elif total > last_total:
+                    diff = total - last_total
+                    print(f"\n🗳️  [NEW VOTE] +{diff} new vote(s)! Total: {total} (Man: {man_count}, Machine: {machine_count})")
+                    if arduino and arduino.is_open:
+                        send_to_arduino(arduino, f"NEW_VOTE:{diff}")
+                        time.sleep(diff * 0.15)
+                        send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
+                    if osc_client:
+                        try:
+                            osc_client.send_message("/battle/votes", f"{man_count},{machine_count},{man_leds},{machine_leds}")
+                        except Exception:
+                            pass
+                    last_total = total
+                    last_man_leds = man_leds
+                    last_machine_leds = machine_leds
+                elif man_leds != last_man_leds or machine_leds != last_machine_leds:
+                    print(f"📊 [PARTITION SHIFT] Man: {last_man_leds}→{man_leds}/3 | Machine: {last_machine_leds}→{machine_leds}/3")
+                    if arduino and arduino.is_open:
+                        send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
+                    last_man_leds = man_leds
+                    last_machine_leds = machine_leds
+
+            # Non-blocking sleep responsive to stop_event
+            for _ in range(int(poll_interval * 10)):
+                if voting_stop_event.is_set():
+                    break
+                time.sleep(0.1)
+
+    voting_thread = threading.Thread(target=_poll_loop, daemon=True)
+    voting_thread.start()
+
+
+def stop_vote_polling():
+    """Stop the background Supabase vote polling thread."""
+    global voting_thread, voting_stop_event
+    voting_stop_event.set()
+    if voting_thread and voting_thread.is_alive():
+        voting_thread.join(timeout=0.6)
+        voting_thread = None
+
+
+atexit.register(stop_vote_polling)
+
+
 def ask_grok(user_input, history=None):
     """Call Grok API to generate 2-4 punchy rhyming rap bars."""
     if not GROK_API_KEY:
@@ -308,24 +511,41 @@ def ask_grok(user_input, history=None):
         messages.extend(history[-4:])
     messages.append({"role": "user", "content": user_input})
 
-    payload = {
-        "model": GROK_MODEL,
-        "messages": messages,
-        "max_tokens": 120,
-        "temperature": 1
-    }
+    # Try requested model first, then auto-fallback to ultra-fast grok-3-mini
+    models_to_try = [GROK_MODEL]
+    if GROK_MODEL != "grok-3-mini":
+        models_to_try.append("grok-3-mini")
 
-    try:
-        res = requests.post(url, headers=headers, json=payload, timeout=12)
-        if res.status_code == 200:
-            data = res.json()
-            return data["choices"][0]["message"]["content"].strip()
-        else:
-            print(f"⚠️  Grok API returned {res.status_code}: {res.text}")
-            return None
-    except requests.RequestException as e:
-        print(f"⚠️  Grok request error: {e}")
-        return None
+    for model in models_to_try:
+        try:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": 100,
+                "temperature": 1
+            }
+            res = requests.post(url, headers=headers, json=payload, timeout=GROK_TIMEOUT)
+            if res.status_code == 200:
+                data = res.json()
+                reply = data["choices"][0]["message"]["content"].strip()
+                if reply:
+                    return reply
+            else:
+                print(f"⚠️  Grok API ({model}) returned {res.status_code}: {res.text}")
+        except requests.exceptions.Timeout:
+            print(f"⚠️  Grok API ({model}) timed out (>{GROK_TIMEOUT}s). Trying next fallback...")
+        except requests.RequestException as e:
+            print(f"⚠️  Grok request error ({model}): {e}")
+
+    # Emergency fallback rhyme so the battle NEVER hangs
+    print("⚡ Using emergency battle comeback bar...")
+    emergency_fallbacks = [
+        "You spitting fire or is my network slow?\nEither way I'm the king of this whole rap show!",
+        "WiFi glitched but you still can't match my beat,\nStep back contestant, you just faced defeat!",
+        "Servers lagging but my bars are always tight,\nFlip the switch again, let's keep up the fight!",
+        "I had to pause to let you catch your breath,\nStep up to the mic, I'm spitting lyrical death!"
+    ]
+    return random.choice(emergency_fallbacks)
 
 
 def handle_rap_interaction(prompt, arduino, osc_client, voice_name, history):
@@ -358,21 +578,106 @@ def handle_rap_interaction(prompt, arduino, osc_client, voice_name, history):
         speak_with_grok_tts(reply, voice_id=voice_name)
 
 
-def listen_and_transcribe(recognizer, microphone, phrase_limit=5):
-    """Capture audio from microphone and convert to text."""
-    try:
-        with microphone as source:
-            print("🎧 [Mic Active] Speak into your laptop microphone now...")
-            audio = recognizer.listen(source, timeout=4, phrase_time_limit=phrase_limit)
-        
-        print("⚡ Transcribing your voice...")
-        text = recognizer.recognize_google(audio)
-        return text.strip()
-    except sr.WaitTimeoutError:
-        print("⏱️  (No speech detected)")
+class ContinuousRecorder:
+    """
+    Continuously records microphone audio frames into memory while mic is ON.
+    Stops and returns SpeechRecognition AudioData immediately when mic is switched OFF.
+    Eliminates premature silence cutoffs and phrase timeouts while rapping.
+    """
+    def __init__(self, sample_rate=16000, chunk_size=1024):
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
+        self.p = None
+        self.stream = None
+        self.frames = []
+        self.is_recording = False
+        self.thread = None
+        self.lock = threading.Lock()
+        self.start_time = 0
+
+    def start(self):
+        with self.lock:
+            if self.is_recording:
+                return
+            if pyaudio is None:
+                print("❌ Error: PyAudio is not installed. Run 'pip install pyaudio'.")
+                return
+
+            self.frames = []
+            self.is_recording = True
+            self.start_time = time.time()
+            try:
+                if self.p is None:
+                    self.p = pyaudio.PyAudio()
+                self.stream = self.p.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=self.sample_rate,
+                    input=True,
+                    frames_per_buffer=self.chunk_size
+                )
+            except Exception as e:
+                print(f"⚠️  Error opening microphone stream: {e}")
+                self.is_recording = False
+                return
+
+            def _record_loop():
+                while self.is_recording:
+                    try:
+                        data = self.stream.read(self.chunk_size, exception_on_overflow=False)
+                        if data:
+                            self.frames.append(data)
+                    except Exception:
+                        pass
+                    if time.time() - self.start_time > 60:
+                        print("\n⏱️  [Safety Limit] Maximum 60s recording reached.")
+                        break
+
+            self.thread = threading.Thread(target=_record_loop, daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        with self.lock:
+            if not self.is_recording:
+                return None
+            self.is_recording = False
+            if self.thread and self.thread.is_alive():
+                self.thread.join(timeout=0.6)
+            if self.stream:
+                try:
+                    self.stream.stop_stream()
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
+            if not self.frames:
+                return None
+            raw_bytes = b"".join(self.frames)
+            return sr.AudioData(raw_bytes, self.sample_rate, 2)
+
+    def close(self):
+        self.stop()
+        if self.p:
+            try:
+                self.p.terminate()
+            except Exception:
+                pass
+            self.p = None
+
+
+def transcribe_audio(recognizer, audio_data):
+    """Convert recorded AudioData to text via Google Speech Recognition."""
+    if not audio_data:
         return None
+    try:
+        print("⚡ Transcribing your voice...")
+        text = recognizer.recognize_google(audio_data)
+        return text.strip()
     except sr.UnknownValueError:
-        print("🤔 (Could not understand audio)")
+        print("🤔 (Could not understand audio or no speech detected)")
+        return None
+    except sr.RequestError as e:
+        print(f"⚠️  Speech recognition service error: {e}")
         return None
     except Exception as e:
         print(f"⚠️  Speech error: {e}")
@@ -386,7 +691,7 @@ def grok_start_battle(arduino, osc_client, voice_name, history):
     """
     print("\n🚀 [START BUTTON PIN 9 PRESSED!] Initializing rap battle...")
     if arduino and arduino.is_open:
-        update_lcd(arduino, "Grok: Entering Stage\nGet ready to rap...")
+        update_lcd(arduino, "Machine Entering Stage\nGet ready to rap...")
 
     url = "https://api.x.ai/v1/chat/completions"
     headers = {
@@ -414,10 +719,10 @@ def grok_start_battle(arduino, osc_client, voice_name, history):
             json={
                 "model": GROK_MODEL,
                 "messages": [{"role": "system", "content": system_prompt}],
-                "max_tokens": 120,
+                "max_tokens": 100,
                 "temperature": 1.0
             },
-            timeout=12
+            timeout=GROK_TIMEOUT
         )
         if res.status_code == 200:
             intro_reply = res.json()["choices"][0]["message"]["content"].strip()
@@ -447,13 +752,17 @@ def grok_start_battle(arduino, osc_client, voice_name, history):
     speak_with_grok_tts(intro_reply, voice_id=voice_name)
 
     if arduino and arduino.is_open:
-        update_lcd(arduino, "Your Turn!\nFlip switch to speak")
+        update_lcd(arduino, "Your Turn! Finished a line? Flip the switch!")
+        play_host_wav("your_turn")
+        play_host_wav("finish_line")
+
 
 
 def main():
-    global BEAT_VOLUME, GROK_VOLUME, UHH_VOLUME
+    global BEAT_VOLUME, GROK_VOLUME, UHH_VOLUME, GROK_MODEL
 
     parser = argparse.ArgumentParser(description="Grok AI Voice Rap Battle with Arduino")
+    parser.add_argument("--model", type=str, default=GROK_MODEL, help=f"xAI Grok model (default: {GROK_MODEL}, e.g. grok-3-mini, grok-3)")
     parser.add_argument("--voice", type=str, default=DEFAULT_VOICE, help=f"xAI TTS voice ID (default: {DEFAULT_VOICE}, e.g. eve, rex, ara, leo)")
     parser.add_argument("--port", type=str, default=None, help="Serial port for Arduino LCD")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baud rate (default: 9600)")
@@ -466,6 +775,7 @@ def main():
     BEAT_VOLUME = args.beat_volume
     GROK_VOLUME = args.grok_volume
     UHH_VOLUME = args.uhh_volume
+    GROK_MODEL = args.model
 
     voice_name = args.voice
     explicit_port = args.port
@@ -487,29 +797,27 @@ def main():
         except Exception as e:
             print(f"⚠️  OSC error: {e}")
 
-    # Setup Microphone
+    # Setup Microphone & Continuous Audio Recorder
     recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 300
-    recognizer.dynamic_energy_threshold = True
-    microphone = sr.Microphone()
-
-    print("\n🎤 Calibrating microphone for ambient room noise...")
-    with microphone as source:
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-    print("✨ Microphone ready.")
+    recorder = ContinuousRecorder()
+    atexit.register(recorder.close)
+    print("✨ Continuous microphone recorder ready.")
 
     # Setup Arduino
     print("\n🔌 Connecting to Arduino LCD...")
     arduino, port = try_connect_arduino(explicit_port, baud)
     if arduino:
         update_lcd(arduino, "Are you ready to battle!?")
+        play_host_wav("ready")
         send_to_arduino(arduino, "STATUS")
     else:
         print("⚠️  Arduino not found. Running in KEYBOARD TEST mode (will auto-connect if plugged in).")
         update_lcd(None, "Are you ready to battle!?")
+        play_host_wav("ready")
 
     history = []
     mic_active = False
+    is_recording = False
     pin9_requested = False
     is_busy = False
     pending_typed_verse = None
@@ -630,9 +938,13 @@ def main():
                                     tty.setcbreak(kbd_fd)
                                 except Exception:
                                     pass
+                    elif ch in ['v', 'V']:
+                        print("\n🗳️  [Keyboard: Check Supabase Votes & Refresh LEDs]")
+                        trigger_round_vote_leds(arduino, osc_client)
                     elif ch in ['q', 'Q']:
                         print("\n👋 Quit requested via keyboard.")
                         restore_terminal()
+                        stop_vote_polling()
                         stop_beat_loop()
                         os._exit(0)
                 else:
@@ -656,6 +968,9 @@ def main():
                             mic_active = False
                             print("\n🔴 [Keyboard: Mic OFF (Pin 7)]")
                             play_uhh_sound()
+                    elif cmd in ['v', 'votes', 'vote']:
+                        print("\n🗳️  [Keyboard: Check Supabase Votes & Refresh LEDs]")
+                        trigger_round_vote_leds(arduino, osc_client)
                     elif cmd in ['b', 'beat']:
                         if beat_stop_event.is_set() or beat_thread is None or not beat_thread.is_alive():
                             start_beat_loop()
@@ -664,6 +979,7 @@ def main():
                     elif cmd in ['u', 'uhh']:
                         play_uhh_sound()
                     elif cmd in ['q', 'quit', 'exit']:
+                        stop_vote_polling()
                         stop_beat_loop()
                         os._exit(0)
                     elif cmd:
@@ -680,13 +996,13 @@ def main():
     print("  [S] or [SPACE]  : Start / Stop Battle Round (Pin 9 button)")
     print("  [M]             : Toggle Mic ON / OFF (simulates Pin 7 switch)")
     print("  [T]             : Type a rap verse directly in terminal")
+    print("  [V]             : Check Supabase votes & refresh LEDs (Pins 4,5,6 & 10,11,12)")
     print("  [B]             : Toggle Beat backing track ON / OFF")
     print("  [U]             : Play 'uhh.mpeg' test")
     print("  [Q] or [Ctrl+C] : Quit")
     print("=" * 60 + "\n")
 
     # Main interaction loop
-    last_mic_state = False
     battle_started = False
 
     while True:
@@ -696,6 +1012,9 @@ def main():
                 pin9_requested = False
                 if not battle_started:
                     print("\n🚀 [START BATTLE] Initializing rap battle round...")
+                    stop_vote_polling()
+                    if arduino and arduino.is_open:
+                        send_to_arduino(arduino, "ALL_OFF")
                     is_busy = True
                     battle_started = True
                     start_beat_loop()
@@ -703,10 +1022,13 @@ def main():
                     is_busy = False
                 else:
                     print("\n🏁 [STOP BATTLE] Ending rap battle round!")
+                    if is_recording:
+                        recorder.stop()
+                        is_recording = False
                     battle_started = False
                     mic_active = False
-                    last_mic_state = False
                     stop_beat_loop()
+                    play_host_wav("round_end")
                     end_round_msg = "Wow, that round was fire!\nNow let's see the votes."
                     update_lcd(arduino, end_round_msg)
                     if osc_client:
@@ -715,41 +1037,66 @@ def main():
                         except Exception:
                             pass
 
-            # Step 2: User responds using Pin 7 Mic Switch or Keyboard [M]
-            if mic_active and not last_mic_state and not is_busy:
-                last_mic_state = True
-                is_busy = True
-                print("\n🎧 [Mic Active] Listening to laptop microphone...")
-                update_lcd(arduino, "Mic Active\nSpit your verse...")
+                    # Display Supabase votes on LEDs (Pins 4,5,6 and Pins 10,11,12)
+                    time.sleep(1.0)
+                    trigger_round_vote_leds(arduino, osc_client)
+                    start_vote_polling(arduino, osc_client)
 
-                user_text = listen_and_transcribe(recognizer, microphone, phrase_limit=phrase_limit)
-                if user_text:
-                    handle_rap_interaction(user_text, arduino, osc_client, voice_name, history)
+            # Step 2: Mic switched ON -> Begin continuous recording
+            if mic_active and not is_recording and not is_busy:
+                is_recording = True
+                battle_started = True
+                print("\n🎙️  [Mic Active] Recording your verse... (Flip switch OFF when finished)")
+                update_lcd(arduino, "Mic Active\nSpit your verse...")
+                recorder.start()
+
+            # Step 3: Mic switched OFF -> Stop recording and send verse to Grok
+            elif not mic_active and is_recording:
+                is_recording = False
+                is_busy = True
+                print("\n🛑 [Mic Switch OFF] Finishing recording, transcribing...")
+                audio_data = recorder.stop()
+
+                min_samples = int(16000 * 2 * 0.3)
+                if audio_data and len(audio_data.get_raw_data()) >= min_samples:
+                    update_lcd(arduino, "Heard your bars!\nTranscribing...")
+                    user_text = transcribe_audio(recognizer, audio_data)
+                    if user_text:
+                        handle_rap_interaction(user_text, arduino, osc_client, voice_name, history)
+                        print("\n👉 [Your Turn] Flip mic switch ON (Pin 7 or press 'm') to rap again!")
+                    else:
+                        update_lcd(arduino, "Could not hear you!\nFlip switch to retry")
                 else:
-                    update_lcd(arduino, "No voice detected\nFlip switch / press 'm'")
+                    print("⚠️  Audio recording was empty or too brief (<0.3s).")
+                    update_lcd(arduino, "Too short!\nFlip switch to rap")
 
                 is_busy = False
-            elif not mic_active and last_mic_state:
-                last_mic_state = False
-                if not is_busy and battle_started:
-                    update_lcd(arduino, "Mic Muted\nFlip switch / press 'm'\nto rap again...")
 
-            # Step 3: User responded by typing a custom verse [T]
+            # Step 4: User responded by typing a custom verse [T]
             if pending_typed_verse and not is_busy:
+                if is_recording:
+                    recorder.stop()
+                    is_recording = False
                 verse = pending_typed_verse
                 pending_typed_verse = None
                 is_busy = True
                 battle_started = True
                 handle_rap_interaction(verse, arduino, osc_client, voice_name, history)
+                print("\n👉 [Your Turn] Flip mic switch ON (Pin 7 or press 'm') to rap again!")
                 is_busy = False
 
-            time.sleep(0.08)
+            time.sleep(0.04)
 
         except (KeyboardInterrupt, EOFError):
             print("\n👋 Battle finished. Goodbye!")
             restore_terminal()
+            if is_recording:
+                recorder.stop()
+            recorder.close()
+            stop_vote_polling()
             stop_beat_loop()
             if arduino and arduino.is_open:
+                send_to_arduino(arduino, "ALL_OFF")
                 send_to_arduino(arduino, "CLEAR")
                 send_to_arduino(arduino, "LINE:0:Grok Offline")
                 arduino.close()

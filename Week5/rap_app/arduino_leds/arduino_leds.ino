@@ -3,25 +3,25 @@
  * 
  * Hardware Setup:
  * - Man Party (3 LEDs):
- *     LED 1 -> Pin 8  (through 220Ω resistor to GND)
- *     LED 2 -> Pin 9  (through 220Ω resistor to GND)
- *     LED 3 -> Pin 10 (through 220Ω resistor to GND)
+ *     LED 1 -> Pin 4  (through 220Ω resistor to GND)
+ *     LED 2 -> Pin 5  (through 220Ω resistor to GND)
+ *     LED 3 -> Pin 6  (through 220Ω resistor to GND)
  * 
  * - Machine Party (3 LEDs):
- *     LED 1 -> Pin 11 (through 220Ω resistor to GND)
- *     LED 2 -> Pin 12 (through 220Ω resistor to GND)
- *     LED 3 -> Pin 13 (through 220Ω resistor to GND)
+ *     LED 1 -> Pin 10 (through 220Ω resistor to GND)
+ *     LED 2 -> Pin 11 (through 220Ω resistor to GND)
+ *     LED 3 -> Pin 12 (through 220Ω resistor to GND)
  * 
  * Wiring Checklist:
- * 1. Anode (long leg of LED) -> Arduino Pin (8, 9, 10, 11, 12, or 13)
+ * 1. Anode (long leg of LED) -> Arduino Pin (4, 5, 6, 10, 11, or 12)
  * 2. Cathode (short leg of LED) -> 220Ω resistor -> Arduino GND rail
  * 3. Make sure the breadboard GND rail is connected back to one of the Arduino GND pins!
  * 4. If your LEDs turn on with LOW (common anode / connected to 5V), change ACTIVE_LOW to true below.
  */
 
 // ---------------- Pins Configuration ----------------
-const int MAN_PINS[] = {8, 9, 10};
-const int MACHINE_PINS[] = {11, 12, 13};
+const int MAN_PINS[] = {4, 5, 6};
+const int MACHINE_PINS[] = {10, 11, 12};
 const int LEDS_PER_PARTY = 3;
 
 // Active logic: Set to false for standard GND wiring (HIGH=ON). Set to true if wired to 5V (LOW=ON).
