@@ -9,14 +9,23 @@ Whisper Speech-to-Text to Arduino LCD Bridge
 - Also broadcasts to OSC (port 9000) for UI/visualizer compatibility.
 """
 
+import os
 import sys
 import time
 import glob
 import textwrap
 import argparse
+import subprocess
+import requests
 import numpy as np
 import speech_recognition as sr
 import whisper
+from dotenv import load_dotenv
+
+# Load .env file (for GROK_API_KEY)
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv()
 
 try:
     from pythonosc import udp_client
@@ -42,6 +51,102 @@ OSC_PORT = 9000
 
 LCD_COLS = 20
 LCD_ROWS = 4
+
+# Grok & Voice Configuration
+GROK_API_KEY = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
+GROK_MODEL = "grok-3"  # Standard xAI model
+DEFAULT_VOICE = "eve"  # xAI TTS voice (e.g., eve, rex, ara, leo)
+TTS_TEMP_FILE = "/tmp/grok_tts_reply.mp3"
+
+
+def speak_text_grok_tts(text, voice_id=DEFAULT_VOICE):
+    """
+    Generate speech using xAI's official Text-to-Speech API (https://api.x.ai/v1/tts)
+    and play it immediately via macOS 'afplay'.
+    """
+    if not text:
+        return
+
+    clean = text.replace("*", "").replace("#", "").replace('"', '').strip()
+
+    if GROK_API_KEY:
+        try:
+            print(f"🎙️  Synthesizing with Grok TTS (voice: '{voice_id}')...")
+            url = "https://api.x.ai/v1/tts"
+            headers = {
+                "Authorization": f"Bearer {GROK_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "text": clean,
+                "voice_id": voice_id,
+                "language": "en",
+            }
+
+            response = requests.post(url, headers=headers, json=payload, timeout=15)
+            if response.status_code == 200:
+                with open(TTS_TEMP_FILE, "wb") as f:
+                    f.write(response.content)
+                print(f"🔊 Playing Grok voice ({len(response.content)} bytes)...")
+                subprocess.run(["afplay", TTS_TEMP_FILE], check=False)
+                return
+            else:
+                print(f"⚠️  xAI TTS returned {response.status_code}: {response.text}")
+        except Exception as e:
+            print(f"⚠️  xAI TTS error: {e}")
+
+    # Fallback to local macOS voice if xAI TTS fails or offline
+    try:
+        print(f"🔊 Fallback speaking with macOS TTS: \"{clean}\"")
+        subprocess.run(["say", clean], check=False)
+    except Exception as e:
+        print(f"⚠️  TTS fallback error: {e}")
+
+
+def ask_grok(user_input, history=None):
+    """
+    Send recognized user input to xAI Grok and return a punchy response/rap back.
+    """
+    if not GROK_API_KEY:
+        print("⚠️  No GROK_API_KEY found in .env. Skipping Grok response.")
+        return None
+
+    url = "https://api.x.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    system_prompt = (
+        "You are an energetic, witty freestyle rap battle opponent and hype host. "
+        "The user will rap or speak to you. Respond directly with 2 to 4 punchy, rhyming rap bars "
+        "reacting to what they said. Keep it concise, clever, and rhythmic. Do not include introductory notes."
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    if history:
+        messages.extend(history[-4:])  # Keep last 4 turns for context
+    messages.append({"role": "user", "content": user_input})
+
+    payload = {
+        "model": GROK_MODEL,
+        "messages": messages,
+        "max_tokens": 120,
+        "temperature": 0.8
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=12)
+        if response.status_code == 200:
+            data = response.json()
+            reply = data["choices"][0]["message"]["content"].strip()
+            return reply
+        else:
+            print(f"⚠️  Grok API returned status {response.status_code}: {response.text}")
+            return None
+    except requests.RequestException as e:
+        print(f"⚠️  Grok request error: {e}")
+        return None
 
 
 def find_arduino_ports():
@@ -131,6 +236,8 @@ def main():
     parser.add_argument("--port", type=str, default=None, help="Serial port (e.g. /dev/cu.usbmodem1101)")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baud rate (default: 9600)")
     parser.add_argument("--phrase-limit", type=int, default=4, help="Max phrase record duration in seconds (default: 4s)")
+    parser.add_argument("--voice", type=str, default=DEFAULT_VOICE, help=f"xAI TTS voice ID (default: {DEFAULT_VOICE}, e.g. eve, rex, ara, leo)")
+    parser.add_argument("--no-grok", action="store_true", help="Disable Grok AI response generation")
     args = parser.parse_args()
 
     explicit_port = args.port
@@ -138,6 +245,8 @@ def main():
     model_name = args.model
     language = None if args.language.lower() == "auto" else args.language
     phrase_time_limit = args.phrase_limit
+    voice_name = args.voice
+    use_grok = not args.no_grok
 
     # -----------------------------
     # OSC SETUP
@@ -187,6 +296,7 @@ def main():
 
     mic_enabled = True  # Tracks whether microphone listening is enabled
     last_displayed_status = None
+    conversation_history = []
 
     # -----------------------------
     # MAIN LOOP
@@ -272,18 +382,40 @@ def main():
 
             print(f"\n🎤 Heard: \"{transcript}\"")
 
-            # 1. Send to Arduino LCD
+            # 1. Send what user said to Arduino LCD
             if arduino and arduino.is_open:
-                update_lcd(arduino, transcript)
+                update_lcd(arduino, f"You: {transcript}")
             else:
                 print("⚠️  [LCD Offline] Formatted Preview:")
-                for row_txt in format_text_for_lcd(transcript):
+                for row_txt in format_text_for_lcd(f"You: {transcript}"):
                     print(f"   │{row_txt.ljust(LCD_COLS)}│")
 
             # 2. Send OSC messages (compatible with voice.py)
             if osc_client:
                 osc_client.send_message("/speech/raw", transcript)
                 osc_client.send_message("/speech", transcript.lower())
+
+            # 3. Generate reactive response with Grok & Voice output
+            if use_grok and GROK_API_KEY:
+                print("\n🤖 Grok is writing bars in response...")
+                if arduino and arduino.is_open:
+                    send_to_arduino(arduino, "LINE:3:Grok thinking...")
+                grok_reply = ask_grok(transcript, conversation_history)
+                if grok_reply:
+                    conversation_history.append({"role": "user", "content": transcript})
+                    conversation_history.append({"role": "assistant", "content": grok_reply})
+                    print(f"\n🔥 Grok: \"{grok_reply}\"")
+
+                    # Display Grok's reply on the LCD (auto-scrolls if long)
+                    if arduino and arduino.is_open:
+                        update_lcd(arduino, f"Grok: {grok_reply}")
+
+                    # Broadcast Grok's reply over OSC
+                    if osc_client:
+                        osc_client.send_message("/grok/reply", grok_reply)
+
+                    # Speak Grok's response out loud via xAI Grok TTS API
+                    speak_text_grok_tts(grok_reply, voice_id=voice_name)
 
         except sr.WaitTimeoutError:
             # Silence / timeout is normal when nobody is speaking
