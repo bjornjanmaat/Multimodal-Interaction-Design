@@ -178,8 +178,8 @@ def ask_grok(user_input, history=None):
     }
     system_prompt = (
         "You are an energetic, witty freestyle rap battle host and opponent. "
-        "The user will rap or speak to you. Respond directly with 2 to 4 "
-        "punchy, rhyming freestyle rap bars reacting to what they said. Keep it clever and rhythmic. "
+        "The user will rap or speak to you. Respond directly with 2 couplets of rap. "
+        "Punchy, rhyming freestyle rap bars reacting to what they said. Keep it clever and rhythmic. "
         "Output ONLY the rap lyrics without intro notes."
         "Talk fast like an actual rapper."
     )
@@ -258,6 +258,73 @@ def listen_and_transcribe(recognizer, microphone, phrase_limit=5):
         return None
 
 
+def grok_start_battle(arduino, osc_client, voice_name, history):
+    """
+    Called when button on Pin 9 is pressed.
+    Grok says hi, welcomes the user to the battle, and drops the opening freestyle rap bars!
+    """
+    print("\n🚀 [START BUTTON PIN 9 PRESSED!] Initializing rap battle...")
+    if arduino and arduino.is_open:
+        update_lcd(arduino, "Grok: Entering Stage\nGet ready to rap...")
+
+    url = "https://api.x.ai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    system_prompt = (
+        "You are an energetic, fast-talking freestyle rap battle host and opponent. "
+        "Start the battle right now! Give a quick, hype greeting ('Yo! Welcome to the stage!'), "
+        "followed immediately by 3 to 4 punchy, fast rhyming opening rap bars challenging the user to step up. "
+        "Talk fast like an actual rapper. Output ONLY the spoken words and rap lyrics without any meta notes."
+    )
+
+    intro_reply = None
+    try:
+        res = requests.post(
+            url,
+            headers=headers,
+            json={
+                "model": GROK_MODEL,
+                "messages": [{"role": "system", "content": system_prompt}],
+                "max_tokens": 120,
+                "temperature": 1.0
+            },
+            timeout=12
+        )
+        if res.status_code == 200:
+            intro_reply = res.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"⚠️  Grok start error: {e}")
+
+    if not intro_reply:
+        intro_reply = (
+            "Yo! Welcome to the stage, the spotlight is lit! "
+            "I'm droppin' heavy venom, every bar is a hit! "
+            "Grab the mic, flip the switch, let me hear what you got— "
+            "Can you match my tempo or you freezin' on the spot?!"
+        )
+
+    history.clear()
+    history.append({"role": "assistant", "content": intro_reply})
+
+    print(f"\n🔥 Grok Intro:\n{intro_reply}\n")
+
+    # 1. Update LCD screen (auto-scrolls)
+    if arduino and arduino.is_open:
+        update_lcd(arduino, f"Grok: {intro_reply}")
+
+    # 2. Broadcast via OSC
+    if osc_client:
+        osc_client.send_message("/grok/reply", intro_reply)
+
+    # 3. Speak via xAI Grok TTS
+    speak_with_grok_tts(intro_reply, voice_id=voice_name)
+
+    if arduino and arduino.is_open:
+        update_lcd(arduino, "Your Turn!\nFlip switch to speak")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Grok AI Voice Rap Battle with Arduino")
     parser.add_argument("--voice", type=str, default=DEFAULT_VOICE, help=f"xAI TTS voice ID (default: {DEFAULT_VOICE}, e.g. eve, rex, ara, leo)")
@@ -300,18 +367,19 @@ def main():
     print("\n🔌 Connecting to Arduino LCD...")
     arduino, port = try_connect_arduino(explicit_port, baud)
     if arduino:
-        update_lcd(arduino, "Grok Rap Battle\nPress btn to speak")
+        update_lcd(arduino, "Press Pin 9 Button\nto start battle!")
         send_to_arduino(arduino, "STATUS")
     else:
         print("⚠️  Arduino not found initially. Script will retry in background.")
 
     history = []
-    button_pressed = False
+    mic_active = False
+    start_requested = False
     is_busy = False
 
     # Thread to monitor serial messages from Arduino
     def serial_monitor():
-        nonlocal arduino, button_pressed
+        nonlocal arduino, mic_active, start_requested
         while True:
             try:
                 if arduino is None or not arduino.is_open:
@@ -323,15 +391,20 @@ def main():
 
                 if arduino.in_waiting > 0:
                     line = arduino.readline().decode(errors="ignore").strip()
-                    if line == "BTN:ON":
-                        button_pressed = True
-                    elif line == "BTN:OFF":
-                        button_pressed = False
+                    if line == "START_BTN:PRESSED":
+                        print("\n🔘 [Start Button Pin 9 Pressed]")
+                        start_requested = True
+                    elif line in ["MIC:ON", "BTN:ON"]:
+                        mic_active = True
+                        print("🟢 [Mic Switch Pin 7: ON]")
+                    elif line in ["MIC:OFF", "BTN:OFF"]:
+                        mic_active = False
+                        print("🔴 [Mic Switch Pin 7: OFF]")
                     elif line.startswith("ACK:"):
                         pass
                     elif line:
                         print(f"   [Arduino] {line}")
-                time.sleep(0.04)
+                time.sleep(0.03)
             except Exception:
                 arduino = None
                 time.sleep(1)
@@ -340,34 +413,49 @@ def main():
     t.start()
 
     print("\n" + "=" * 60)
-    print("🎙️  READY: Press the Arduino button on Pin 7 to activate the mic and speak!")
-    print("   Or type your verse in the terminal and press Enter.")
+    print("🎮 INSTRUCTIONS:")
+    print("  1. Press the Button on PIN 9 to START the battle (Grok will speak first!).")
+    print("  2. Turn Switch on PIN 7 ON to activate mic & speak your verse.")
+    print("  3. Turn Switch on PIN 7 OFF when done / muted.")
+    print("  (You can also type directly in this terminal anytime)")
     print("=" * 60 + "\n")
 
     # Main interaction loop
-    last_btn_state = False
+    last_mic_state = False
+    battle_started = False
+
     while True:
         try:
-            # Check if button changed to ON (pressed)
-            if button_pressed and not last_btn_state and not is_busy:
-                last_btn_state = True
+            # Step 1: Start battle via Pin 9 button
+            if start_requested and not is_busy:
+                start_requested = False
                 is_busy = True
-                print("\n🔘 [Button Pressed] Listening to laptop microphone...")
+                battle_started = True
+                grok_start_battle(arduino, osc_client, voice_name, history)
+                is_busy = False
+
+            # Step 2: User responds using Pin 7 Mic Switch
+            if mic_active and not last_mic_state and not is_busy:
+                last_mic_state = True
+                is_busy = True
+                print("\n🎧 [Mic Active] Listening to laptop microphone...")
                 if arduino and arduino.is_open:
-                    update_lcd(arduino, "Mic Active\nSpeak into laptop...")
+                    update_lcd(arduino, "Mic Active\nSpit your verse...")
 
                 user_text = listen_and_transcribe(recognizer, microphone, phrase_limit=phrase_limit)
                 if user_text:
                     handle_rap_interaction(user_text, arduino, osc_client, voice_name, history)
                 else:
                     if arduino and arduino.is_open:
-                        update_lcd(arduino, "No speech detected\nPress btn again")
+                        update_lcd(arduino, "No voice detected\nFlip switch to retry")
 
                 is_busy = False
-            elif not button_pressed and last_btn_state:
-                last_btn_state = False
+            elif not mic_active and last_mic_state:
+                last_mic_state = False
+                if not is_busy and battle_started and arduino and arduino.is_open:
+                    update_lcd(arduino, "Mic Muted\nFlip switch on Pin 7\nto rap again...")
 
-            time.sleep(0.1)
+            time.sleep(0.08)
 
         except (KeyboardInterrupt, EOFError):
             print("\n👋 Battle finished. Goodbye!")

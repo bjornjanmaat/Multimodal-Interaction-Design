@@ -4,11 +4,20 @@
 // Set the LCD address (0x26, 0x27, or 0x3F) for a 20-column, 4-line display
 LiquidCrystal_I2C lcd(0x26, 20, 4);
 
-// Button Pin (Connect button between PIN 7 and GND)
-const int BUTTON_PIN = 7;
-int lastButtonReading = HIGH;
-int buttonState = HIGH;
-unsigned long lastDebounceTime = 0;
+// Button / Switch Pins (Internal Pull-Up: Connect button/switch to GND)
+const int MIC_SWITCH_PIN = 7;    // Pin 7: Mic toggle switch (ON/OFF)
+const int START_BUTTON_PIN = 9;  // Pin 9: Battle Start button
+
+// Mic switch debounce state
+int lastMicReading = HIGH;
+int micState = HIGH;
+unsigned long lastMicDebounce = 0;
+
+// Start button debounce state
+int lastStartReading = HIGH;
+int startButtonState = HIGH;
+unsigned long lastStartDebounce = 0;
+
 const unsigned long DEBOUNCE_DELAY = 50;
 
 // Helper function to write a full 20-char line, padding remaining characters with spaces
@@ -100,44 +109,65 @@ void setText(String text) {
 void setup() {
   Serial.begin(9600);
 
-  // Use internal pullup resistor: LOW when pressed / switch ON to GND, HIGH when open
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Use internal pullup resistors: LOW when connected to GND, HIGH when open
+  pinMode(MIC_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(START_BUTTON_PIN, INPUT_PULLUP);
 
   lcd.init();      // Initialize the LCD
   lcd.backlight(); // Turn on backlight
 
   // Initial welcome screen
-  setText("Whisper LCD Ready Rap Speech-to-Text Speak into mic...");
+  setText("Rap Battle Ready  Press Start Button  Pin 9 to begin!");
 
   Serial.println("LCD_READY");
 
-  // Broadcast initial button state
-  int initialRead = digitalRead(BUTTON_PIN);
-  buttonState = initialRead;
-  lastButtonReading = initialRead;
-  if (buttonState == LOW) {
-    Serial.println("BTN:ON");
+  // Broadcast initial mic switch state
+  int initialMic = digitalRead(MIC_SWITCH_PIN);
+  micState = initialMic;
+  lastMicReading = initialMic;
+  if (micState == LOW) {
+    Serial.println("MIC:ON");
+    Serial.println("BTN:ON"); // legacy compatibility
   } else {
-    Serial.println("BTN:OFF");
+    Serial.println("MIC:OFF");
+    Serial.println("BTN:OFF"); // legacy compatibility
   }
 }
 
 void loop() {
-  // Read and debounce button switch
-  int reading = digitalRead(BUTTON_PIN);
-  if (reading != lastButtonReading) {
-    lastDebounceTime = millis();
-  }
-  lastButtonReading = reading;
+  unsigned long now = millis();
 
-  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
-    if (reading != buttonState) {
-      buttonState = reading;
-      // INPUT_PULLUP: LOW = Switch Closed / Button Pressed, HIGH = Switch Open / Button Released
-      if (buttonState == LOW) {
+  // 1. Read and debounce Mic Switch (Pin 7)
+  int micRead = digitalRead(MIC_SWITCH_PIN);
+  if (micRead != lastMicReading) {
+    lastMicDebounce = now;
+  }
+  lastMicReading = micRead;
+  if ((now - lastMicDebounce) > DEBOUNCE_DELAY) {
+    if (micRead != micState) {
+      micState = micRead;
+      if (micState == LOW) {
+        Serial.println("MIC:ON");
         Serial.println("BTN:ON");
       } else {
+        Serial.println("MIC:OFF");
         Serial.println("BTN:OFF");
+      }
+    }
+  }
+
+  // 2. Read and debounce Start Button (Pin 9)
+  int startRead = digitalRead(START_BUTTON_PIN);
+  if (startRead != lastStartReading) {
+    lastStartDebounce = now;
+  }
+  lastStartReading = startRead;
+  if ((now - lastStartDebounce) > DEBOUNCE_DELAY) {
+    if (startRead != startButtonState) {
+      startButtonState = startRead;
+      if (startButtonState == LOW) {
+        // Triggered upon pressing down
+        Serial.println("START_BTN:PRESSED");
       }
     }
   }
@@ -155,9 +185,11 @@ void loop() {
         Serial.println("ACK:CLEARED");
       } 
       else if (msg.equalsIgnoreCase("STATUS")) {
-        if (buttonState == LOW) {
+        if (micState == LOW) {
+          Serial.println("MIC:ON");
           Serial.println("BTN:ON");
         } else {
+          Serial.println("MIC:OFF");
           Serial.println("BTN:OFF");
         }
       }
