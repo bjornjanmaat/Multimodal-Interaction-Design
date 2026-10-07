@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Grok AI Voice Battle with Arduino Button & LCD
 ----------------------------------------------
