@@ -422,8 +422,8 @@ def grok_start_battle(arduino, osc_client, voice_name, history):
 
     if not intro_reply:
         intro_reply = (
-            "Yo, welcome to the stage, the spotlight is lit, "
-            "Grab the mic right now, let me hear your hit!"
+            "Your turn, contestant!"
+            "Finished a line? Flip the switch!"
         )
 
     history.clear()
@@ -506,13 +506,13 @@ def main():
 
     history = []
     mic_active = False
-    start_requested = False
+    pin9_requested = False
     is_busy = False
     pending_typed_verse = None
 
     # Thread to monitor serial messages from Arduino
     def serial_monitor():
-        nonlocal arduino, mic_active, start_requested
+        nonlocal arduino, mic_active, pin9_requested
         while True:
             try:
                 if arduino is None or not arduino.is_open:
@@ -525,9 +525,8 @@ def main():
                 if arduino.in_waiting > 0:
                     line = arduino.readline().decode(errors="ignore").strip()
                     if line == "START_BTN:PRESSED":
-                        print("\n🔘 [Start Button Pin 9 Pressed]")
-                        start_requested = True
-                        start_beat_loop()
+                        print("\n🔘 [Start/Stop Button Pin 9 Pressed]")
+                        pin9_requested = True
                     elif line in ["MIC:ON", "BTN:ON"]:
                         if not mic_active:
                             mic_active = True
@@ -575,7 +574,7 @@ def main():
 
     # Thread to monitor keyboard input for testing without Arduino
     def keyboard_monitor():
-        nonlocal mic_active, start_requested, pending_typed_verse, is_busy, is_tty, kbd_fd
+        nonlocal mic_active, pin9_requested, pending_typed_verse, is_busy, is_tty, kbd_fd, battle_started
 
         while True:
             try:
@@ -588,9 +587,11 @@ def main():
                         continue
 
                     if ch in ['s', 'S', ' ']:
-                        print("\n🔘 [Keyboard: Start Battle Triggered (Pin 9)]")
-                        start_requested = True
-                        start_beat_loop()
+                        if not battle_started:
+                            print("\n🔘 [Keyboard: Pin 9 (Start Battle)]")
+                        else:
+                            print("\n🔘 [Keyboard: Pin 9 (Stop Battle)]")
+                        pin9_requested = True
                     elif ch in ['m', 'M']:
                         if not mic_active:
                             mic_active = True
@@ -637,10 +638,12 @@ def main():
                         time.sleep(0.1)
                         continue
                     cmd = line.strip().lower()
-                    if cmd in ['s', 'start', 'space']:
-                        print("\n🔘 [Keyboard: Start Battle (Pin 9)]")
-                        start_requested = True
-                        start_beat_loop()
+                    if cmd in ['s', 'start', 'stop', 'space']:
+                        if not battle_started:
+                            print("\n🔘 [Keyboard: Pin 9 (Start Battle)]")
+                        else:
+                            print("\n🔘 [Keyboard: Pin 9 (Stop Battle)]")
+                        pin9_requested = True
                     elif cmd in ['m', 'mic']:
                         if not mic_active:
                             mic_active = True
@@ -670,7 +673,7 @@ def main():
 
     print("\n" + "=" * 60)
     print("🎮 CONTROLS (ARDUINO & KEYBOARD):")
-    print("  [S] or [SPACE]  : Start Battle (simulates Pin 9 button)")
+    print("  [S] or [SPACE]  : Start / Stop Battle Round (Pin 9 button)")
     print("  [M]             : Toggle Mic ON / OFF (simulates Pin 7 switch)")
     print("  [T]             : Type a rap verse directly in terminal")
     print("  [B]             : Toggle Beat backing track ON / OFF")
@@ -684,14 +687,29 @@ def main():
 
     while True:
         try:
-            # Step 1: Start battle via Pin 9 button or Keyboard
-            if start_requested and not is_busy:
-                start_requested = False
-                is_busy = True
-                battle_started = True
-                start_beat_loop()
-                grok_start_battle(arduino, osc_client, voice_name, history)
-                is_busy = False
+            # Step 1: Handle Pin 9 button or Keyboard [S]/[SPACE] (Toggle Start/Stop)
+            if pin9_requested and not is_busy:
+                pin9_requested = False
+                if not battle_started:
+                    print("\n🚀 [START BATTLE] Initializing rap battle round...")
+                    is_busy = True
+                    battle_started = True
+                    start_beat_loop()
+                    grok_start_battle(arduino, osc_client, voice_name, history)
+                    is_busy = False
+                else:
+                    print("\n🏁 [STOP BATTLE] Ending rap battle round!")
+                    battle_started = False
+                    mic_active = False
+                    last_mic_state = False
+                    stop_beat_loop()
+                    end_round_msg = "Wow, that round was fire!\nNow let's see the votes."
+                    update_lcd(arduino, end_round_msg)
+                    if osc_client:
+                        try:
+                            osc_client.send_message("/battle/round_ended", end_round_msg)
+                        except Exception:
+                            pass
 
             # Step 2: User responds using Pin 7 Mic Switch or Keyboard [M]
             if mic_active and not last_mic_state and not is_busy:
