@@ -23,6 +23,13 @@ import argparse
 import threading
 import subprocess
 import atexit
+import select
+try:
+    import termios
+    import tty
+    HAS_TERMIOS = True
+except ImportError:
+    HAS_TERMIOS = False
 import requests
 import speech_recognition as sr
 from dotenv import load_dotenv
@@ -282,11 +289,16 @@ def ask_grok(user_input, history=None):
         "Content-Type": "application/json"
     }
     system_prompt = (
-        "You are an energetic, witty freestyle rap battle host and opponent. "
-        "The user will rap or speak to you. Respond directly with 2 couplets of rap. Use maximum 20 words total."
-        "Punchy, rhyming freestyle rap bars reacting to what they said. Keep it clever and rhythmic. "
-        "Output ONLY the rap lyrics without intro notes."
-        "Talk fast like an actual rapper."
+        "You are an energetic, witty freestyle rap battle MC. "
+        "You are rapping over a 4/4 hip-hop beat at 96 BPM (1 bar = 4 beats). "
+        "Respond directly to what the user said with exactly 2 rhyming bars (couplet). "
+        "RHYTHM AND METER RULES:\n"
+        "- Exactly 2 rhyming lines that rhyme with each other (AA scheme).\n"
+        "- Each line MUST have exactly 8 to 10 syllables (around 6 to 8 words per line) so it fills one 4-beat bar.\n"
+        "- Use commas to mark natural rhythmic pauses on the beat.\n"
+        "- Total word count must be between 12 and 18 words total.\n"
+        "- Keep it punchy, rhythmic, and clever.\n"
+        "- Output ONLY the spoken rap lyrics without quotes, titles, emojis, or intro notes."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -378,10 +390,16 @@ def grok_start_battle(arduino, osc_client, voice_name, history):
         "Content-Type": "application/json"
     }
     system_prompt = (
-        "You are an energetic, fast-talking freestyle rap battle host and opponent. "
-        "Start the battle right now! Give a quick, hype greeting ('Yo! Welcome to the stage!'), "
-        "followed immediately by 3 to 4 punchy, fast rhyming opening rap bars challenging the user to step up. "
-        "Talk fast like an actual rapper. Output ONLY the spoken words and rap lyrics without any meta notes."
+        "You are an energetic freestyle rap battle host and opponent MC. "
+        "You are dropping the opening bars over a 4/4 boom-bap beat at 96 BPM. "
+        "Start the battle right now! Challenge the user to step up to the mic. "
+        "RHYTHM AND METER RULES:\n"
+        "- Exactly 2 rhyming bars (couplet).\n"
+        "- Each line MUST have 8 to 10 syllables (around 6 to 8 words per line) to fit a 4-beat musical measure.\n"
+        "- Tight internal bounce, punchy delivery, and hard end rhymes.\n"
+        "- Use commas for rhythmic pauses.\n"
+        "- Total length must be under 18 words.\n"
+        "- Output ONLY the spoken rap bars without quotes, titles, emojis, or stage notes."
     )
 
     intro_reply = None
@@ -404,10 +422,8 @@ def grok_start_battle(arduino, osc_client, voice_name, history):
 
     if not intro_reply:
         intro_reply = (
-            "Yo! Welcome to the stage, the spotlight is lit! "
-            "I'm droppin' heavy venom, every bar is a hit! "
-            "Grab the mic, flip the switch, let me hear what you got— "
-            "Can you match my tempo or you freezin' on the spot?!"
+            "Yo, welcome to the stage, the spotlight is lit, "
+            "Grab the mic right now, let me hear your hit!"
         )
 
     history.clear()
@@ -485,12 +501,14 @@ def main():
         update_lcd(arduino, "Are you ready to battle!?")
         send_to_arduino(arduino, "STATUS")
     else:
-        print("⚠️  Arduino not found initially. Script will retry in background.")
+        print("⚠️  Arduino not found. Running in KEYBOARD TEST mode (will auto-connect if plugged in).")
+        update_lcd(None, "Are you ready to battle!?")
 
     history = []
     mic_active = False
     start_requested = False
     is_busy = False
+    pending_typed_verse = None
 
     # Thread to monitor serial messages from Arduino
     def serial_monitor():
@@ -528,15 +546,136 @@ def main():
                 arduino = None
                 time.sleep(1)
 
-    t = threading.Thread(target=serial_monitor, daemon=True)
-    t.start()
+    t_serial = threading.Thread(target=serial_monitor, daemon=True)
+    t_serial.start()
+
+    # Terminal state management for keyboard monitoring
+    kbd_fd = None
+    kbd_old_settings = None
+    is_tty = False
+
+    if HAS_TERMIOS and sys.stdin.isatty():
+        try:
+            kbd_fd = sys.stdin.fileno()
+            kbd_old_settings = termios.tcgetattr(kbd_fd)
+            tty.setcbreak(kbd_fd)
+            is_tty = True
+        except Exception:
+            is_tty = False
+
+    def restore_terminal():
+        nonlocal is_tty, kbd_fd, kbd_old_settings
+        if is_tty and kbd_fd is not None and kbd_old_settings is not None:
+            try:
+                termios.tcsetattr(kbd_fd, termios.TCSADRAIN, kbd_old_settings)
+            except Exception:
+                pass
+
+    atexit.register(restore_terminal)
+
+    # Thread to monitor keyboard input for testing without Arduino
+    def keyboard_monitor():
+        nonlocal mic_active, start_requested, pending_typed_verse, is_busy, is_tty, kbd_fd
+
+        while True:
+            try:
+                if is_tty:
+                    r, _, _ = select.select([sys.stdin], [], [], 0.08)
+                    if not r:
+                        continue
+                    ch = sys.stdin.read(1)
+                    if not ch:
+                        continue
+
+                    if ch in ['s', 'S', ' ']:
+                        print("\n🔘 [Keyboard: Start Battle Triggered (Pin 9)]")
+                        start_requested = True
+                        start_beat_loop()
+                    elif ch in ['m', 'M']:
+                        if not mic_active:
+                            mic_active = True
+                            print("\n🟢 [Keyboard: Mic ON (Pin 7) - Speak now! Press 'm' again to finish]")
+                        else:
+                            mic_active = False
+                            print("\n🔴 [Keyboard: Mic OFF (Pin 7)]")
+                            play_uhh_sound()
+                    elif ch in ['b', 'B']:
+                        if beat_stop_event.is_set() or beat_thread is None or not beat_thread.is_alive():
+                            print("\n🎵 [Keyboard: Beat Loop ON]")
+                            start_beat_loop()
+                        else:
+                            print("\n⏹️  [Keyboard: Beat Loop OFF]")
+                            stop_beat_loop()
+                    elif ch in ['u', 'U']:
+                        print("\n🔊 [Keyboard: Play 'uhh.mpeg' FX]")
+                        play_uhh_sound()
+                    elif ch in ['t', 'T']:
+                        # Temporarily restore canonical mode so user can type line
+                        restore_terminal()
+                        try:
+                            print("\n" + "─" * 40)
+                            verse = input("✍️  Type your rap verse: ").strip()
+                            print("─" * 40)
+                            if verse:
+                                play_uhh_sound()
+                                pending_typed_verse = verse
+                        finally:
+                            if HAS_TERMIOS and kbd_fd is not None:
+                                try:
+                                    tty.setcbreak(kbd_fd)
+                                except Exception:
+                                    pass
+                    elif ch in ['q', 'Q']:
+                        print("\n👋 Quit requested via keyboard.")
+                        restore_terminal()
+                        stop_beat_loop()
+                        os._exit(0)
+                else:
+                    # Non-TTY fallback (line-based)
+                    line = sys.stdin.readline()
+                    if not line:
+                        time.sleep(0.1)
+                        continue
+                    cmd = line.strip().lower()
+                    if cmd in ['s', 'start', 'space']:
+                        print("\n🔘 [Keyboard: Start Battle (Pin 9)]")
+                        start_requested = True
+                        start_beat_loop()
+                    elif cmd in ['m', 'mic']:
+                        if not mic_active:
+                            mic_active = True
+                            print("\n🟢 [Keyboard: Mic ON (Pin 7)]")
+                        else:
+                            mic_active = False
+                            print("\n🔴 [Keyboard: Mic OFF (Pin 7)]")
+                            play_uhh_sound()
+                    elif cmd in ['b', 'beat']:
+                        if beat_stop_event.is_set() or beat_thread is None or not beat_thread.is_alive():
+                            start_beat_loop()
+                        else:
+                            stop_beat_loop()
+                    elif cmd in ['u', 'uhh']:
+                        play_uhh_sound()
+                    elif cmd in ['q', 'quit', 'exit']:
+                        stop_beat_loop()
+                        os._exit(0)
+                    elif cmd:
+                        play_uhh_sound()
+                        pending_typed_verse = line.strip()
+            except Exception:
+                time.sleep(0.08)
+
+    t_kbd = threading.Thread(target=keyboard_monitor, daemon=True)
+    t_kbd.start()
 
     print("\n" + "=" * 60)
-    print("🎮 INSTRUCTIONS:")
-    print("  1. Press the Button on PIN 9 to START the battle (Grok will speak first!).")
-    print("  2. Turn Switch on PIN 7 ON to activate mic & speak your verse.")
-    print("  3. Turn Switch on PIN 7 OFF when done / muted.")
-    print("  (You can also type directly in this terminal anytime)")
+    print("🎮 CONTROLS (ARDUINO & KEYBOARD):")
+    print("  [S] or [SPACE]  : Start Battle (simulates Pin 9 button)")
+    print("  [M]             : Toggle Mic ON / OFF (simulates Pin 7 switch)")
+    print("  [T]             : Type a rap verse directly in terminal")
+    print("  [B]             : Toggle Beat backing track ON / OFF")
+    print("  [U]             : Play 'uhh.mpeg' test")
+    print("  [Q] or [Ctrl+C] : Quit")
     print("=" * 60 + "\n")
 
     # Main interaction loop
@@ -545,7 +684,7 @@ def main():
 
     while True:
         try:
-            # Step 1: Start battle via Pin 9 button
+            # Step 1: Start battle via Pin 9 button or Keyboard
             if start_requested and not is_busy:
                 start_requested = False
                 is_busy = True
@@ -554,31 +693,39 @@ def main():
                 grok_start_battle(arduino, osc_client, voice_name, history)
                 is_busy = False
 
-            # Step 2: User responds using Pin 7 Mic Switch
+            # Step 2: User responds using Pin 7 Mic Switch or Keyboard [M]
             if mic_active and not last_mic_state and not is_busy:
                 last_mic_state = True
                 is_busy = True
                 print("\n🎧 [Mic Active] Listening to laptop microphone...")
-                if arduino and arduino.is_open:
-                    update_lcd(arduino, "Mic Active\nSpit your verse...")
+                update_lcd(arduino, "Mic Active\nSpit your verse...")
 
                 user_text = listen_and_transcribe(recognizer, microphone, phrase_limit=phrase_limit)
                 if user_text:
                     handle_rap_interaction(user_text, arduino, osc_client, voice_name, history)
                 else:
-                    if arduino and arduino.is_open:
-                        update_lcd(arduino, "No voice detected\nFlip switch to retry")
+                    update_lcd(arduino, "No voice detected\nFlip switch / press 'm'")
 
                 is_busy = False
             elif not mic_active and last_mic_state:
                 last_mic_state = False
-                if not is_busy and battle_started and arduino and arduino.is_open:
-                    update_lcd(arduino, "Mic Muted\nFlip switch on Pin 7\nto rap again...")
+                if not is_busy and battle_started:
+                    update_lcd(arduino, "Mic Muted\nFlip switch / press 'm'\nto rap again...")
+
+            # Step 3: User responded by typing a custom verse [T]
+            if pending_typed_verse and not is_busy:
+                verse = pending_typed_verse
+                pending_typed_verse = None
+                is_busy = True
+                battle_started = True
+                handle_rap_interaction(verse, arduino, osc_client, voice_name, history)
+                is_busy = False
 
             time.sleep(0.08)
 
         except (KeyboardInterrupt, EOFError):
             print("\n👋 Battle finished. Goodbye!")
+            restore_terminal()
             stop_beat_loop()
             if arduino and arduino.is_open:
                 send_to_arduino(arduino, "CLEAR")
