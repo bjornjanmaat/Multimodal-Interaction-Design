@@ -116,11 +116,12 @@ def update_lcd(arduino, text):
     
     print("┌" + "─" * LCD_COLS + "┐")
     for row, line in enumerate(lines):
-        # Truncate or pad to exactly LCD_COLS
         padded_line = line[:LCD_COLS]
         print(f"│{padded_line.ljust(LCD_COLS)}│")
-        send_to_arduino(arduino, f"LINE:{row}:{padded_line}")
     print("└" + "─" * LCD_COLS + "┘")
+    # Send full text to Arduino so it can scroll if longer than 4 lines
+    clean_text = " ".join(text.strip().split())
+    send_to_arduino(arduino, f"TEXT:{clean_text}")
 
 
 def main():
@@ -180,9 +181,12 @@ def main():
         recognizer.adjust_for_ambient_noise(source, duration=1)
 
     print("\n" + "=" * 50)
-    print("🎙️  SYSTEM READY - Start speaking or rapping into the microphone!")
+    print("🎙️  SYSTEM READY - Toggle mic with the button on Pin 7!")
     print(f"   Model: {model_name} | Language: {language or 'Auto-detect'} | Phrase limit: {phrase_time_limit}s")
     print("=" * 50 + "\n")
+
+    mic_enabled = True  # Tracks whether microphone listening is enabled
+    last_displayed_status = None
 
     # -----------------------------
     # MAIN LOOP
@@ -192,14 +196,54 @@ def main():
             # Check / reconnect Arduino if connection lost
             if arduino is None or not arduino.is_open:
                 arduino, connected_port = try_connect_arduino(explicit_port, baud)
+                if arduino:
+                    send_to_arduino(arduino, "STATUS")
+
+            # Check for button events or status messages from Arduino
+            if arduino and arduino.is_open:
+                while arduino.in_waiting > 0:
+                    line = arduino.readline().decode(errors="ignore").strip()
+                    if not line:
+                        continue
+                    if line == "BTN:ON":
+                        if not mic_enabled:
+                            mic_enabled = True
+                            print("🟢 [Button] Mic turned ON")
+                            update_lcd(arduino, "Mic Active\nListening...")
+                    elif line == "BTN:OFF":
+                        if mic_enabled:
+                            mic_enabled = False
+                            print("🔴 [Button] Mic turned OFF (Muted)")
+                            update_lcd(arduino, "Mic Muted\nToggle switch/btn\nto speak...")
+                    elif line.startswith("ACK:"):
+                        pass
+                    else:
+                        print(f"   [Arduino] {line}")
+
+            # If microphone is muted, wait briefly and continue checking button
+            if not mic_enabled:
+                time.sleep(0.1)
+                continue
 
             with microphone as source:
                 print("🎧 Listening...")
                 audio = recognizer.listen(
                     source,
-                    timeout=5,
+                    timeout=2,
                     phrase_time_limit=phrase_time_limit
                 )
+
+            # Check if mic was toggled off while listening before transcribing
+            if arduino and arduino.is_open:
+                while arduino.in_waiting > 0:
+                    line = arduino.readline().decode(errors="ignore").strip()
+                    if line == "BTN:OFF":
+                        mic_enabled = False
+                        print("🔴 [Button] Mic turned OFF")
+                        update_lcd(arduino, "Mic Muted\nToggle switch/btn\nto speak...")
+
+            if not mic_enabled:
+                continue
 
             # Convert audio: 16 kHz, 16-bit PCM mono
             raw_audio = audio.get_raw_data(
@@ -240,15 +284,6 @@ def main():
             if osc_client:
                 osc_client.send_message("/speech/raw", transcript)
                 osc_client.send_message("/speech", transcript.lower())
-
-            # Read any serial responses from Arduino (non-blocking)
-            try:
-                if arduino and arduino.is_open and arduino.in_waiting > 0:
-                    response = arduino.readline().decode(errors="ignore").strip()
-                    if response:
-                        print(f"   [Arduino] {response}")
-            except (serial.SerialException, OSError):
-                arduino = None
 
         except sr.WaitTimeoutError:
             # Silence / timeout is normal when nobody is speaking
