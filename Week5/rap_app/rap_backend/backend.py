@@ -13,6 +13,22 @@ Grok AI Voice Battle with Arduino Button & LCD
 - Can also type at the terminal prompt.
 """
 
+# Adjust the system_prompt to control the instructions for Gemini
+# Please keep the Arduino file and the rest of this script as it is
+
+system_prompt = (
+        "You are an energetic, witty freestyle rap battle MC. "
+        "You are rapping over a 4/4 hip-hop beat at 96 BPM (1 bar = 4 beats). "
+        "Respond directly to what the user said with exactly 2 rhyming bars (couplet).\n"
+        "RHYTHM AND METER RULES:\n"
+        "- Exactly 2 rhyming lines that rhyme with each other (AA scheme).\n"
+        "- Each line MUST have exactly 8 to 10 syllables (around 6 to 8 words per line) so it fills one 4-beat bar.\n"
+        "- Use commas to mark natural rhythmic pauses on the beat.\n"
+        "- Total word count must be between 12 and 18 words total.\n"
+        "- Keep it punchy, rhythmic, and clever.\n"
+        "- Output ONLY the spoken rap lyrics without quotes, titles, emojis, or intro notes."
+    )
+
 import os
 import sys
 import time
@@ -517,18 +533,6 @@ def get_gemini_client():
 
 def ask_gemini(user_input, history=None):
     """Call Google Gemini Flash API to generate ultra-fast rhyming rap bars."""
-    system_prompt = (
-        "You are an energetic, witty freestyle rap battle MC. "
-        "You are rapping over a 4/4 hip-hop beat at 96 BPM (1 bar = 4 beats). "
-        "Respond directly to what the user said with exactly 2 rhyming bars (couplet).\n"
-        "RHYTHM AND METER RULES:\n"
-        "- Exactly 2 rhyming lines that rhyme with each other (AA scheme).\n"
-        "- Each line MUST have exactly 8 to 10 syllables (around 6 to 8 words per line) so it fills one 4-beat bar.\n"
-        "- Use commas to mark natural rhythmic pauses on the beat.\n"
-        "- Total word count must be between 12 and 18 words total.\n"
-        "- Keep it punchy, rhythmic, and clever.\n"
-        "- Output ONLY the spoken rap lyrics without quotes, titles, emojis, or intro notes."
-    )
 
     # 1. Primary: Gemini Flash (Google GenAI)
     client = get_gemini_client()
@@ -653,7 +657,7 @@ def handle_rap_interaction(prompt, arduino, osc_client, voice_name, history):
         prompt_display = prompt_clean
 
     print("\n🤖 Machine (Gemini Flash) is writing bars in response...")
-    update_lcd(arduino, f"You: {prompt_display}\nMachine thinking...")
+    update_lcd(arduino, f"{prompt_display}")
 
     reply = ask_gemini(prompt, history)
     if reply:
@@ -663,7 +667,7 @@ def handle_rap_interaction(prompt, arduino, osc_client, voice_name, history):
 
         # 1. Update LCD screen (auto-scrolls if long)
         if arduino and arduino.is_open:
-            update_lcd(arduino, f"Machine: {reply}")
+            update_lcd(arduino, f"{reply}")
 
         # 2. Broadcast via OSC
         if osc_client:
@@ -917,7 +921,7 @@ def gemini_start_battle(arduino, osc_client, voice_name, history):
 
     # 1. Update LCD screen (auto-scrolls)
     if arduino and arduino.is_open:
-        update_lcd(arduino, f"Machine: {intro_reply}")
+        update_lcd(arduino, f"{intro_reply}")
 
     # 2. Broadcast via OSC
     if osc_client:
@@ -1226,9 +1230,9 @@ def main():
                     battle_started = False
                     mic_active = False
                     stop_beat_loop()
-                    play_host_wav("round_end")
                     end_round_msg = "Wow, that round was fire!\nNow let's see the votes."
                     update_lcd(arduino, end_round_msg)
+                    play_host_wav("round_end")
                     if osc_client:
                         try:
                             osc_client.send_message("/battle/round_ended", end_round_msg)
