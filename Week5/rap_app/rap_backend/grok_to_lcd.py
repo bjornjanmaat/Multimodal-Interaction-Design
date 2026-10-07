@@ -56,6 +56,13 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", "vote_app", ".env"))
 load_dotenv()
 
 try:
+    from google import genai
+    from google.genai import types as genai_types
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+
+try:
     from pythonosc import udp_client
     HAS_OSC = True
 except ImportError:
@@ -70,6 +77,8 @@ except ImportError:
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROK_API_KEY = os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -493,12 +502,25 @@ def stop_vote_polling():
 atexit.register(stop_vote_polling)
 
 
-def ask_groq(user_input, history=None):
-    """Call Groq LPU API to generate ultra-fast rhyming rap bars (sub-500ms)."""
+gemini_client = None
+
+def get_gemini_client():
+    """Lazy-initialize Google GenAI client."""
+    global gemini_client
+    if gemini_client is None and HAS_GEMINI and GEMINI_API_KEY:
+        try:
+            gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        except Exception as e:
+            print(f"⚠️  Gemini Client init error: {e}")
+    return gemini_client
+
+
+def ask_gemini(user_input, history=None):
+    """Call Google Gemini Flash API to generate ultra-fast rhyming rap bars."""
     system_prompt = (
         "You are an energetic, witty freestyle rap battle MC. "
         "You are rapping over a 4/4 hip-hop beat at 96 BPM (1 bar = 4 beats). "
-        "Respond directly to what the user said with exactly 2 rhyming bars (couplet). "
+        "Respond directly to what the user said with exactly 2 rhyming bars (couplet).\n"
         "RHYTHM AND METER RULES:\n"
         "- Exactly 2 rhyming lines that rhyme with each other (AA scheme).\n"
         "- Each line MUST have exactly 8 to 10 syllables (around 6 to 8 words per line) so it fills one 4-beat bar.\n"
@@ -508,12 +530,56 @@ def ask_groq(user_input, history=None):
         "- Output ONLY the spoken rap lyrics without quotes, titles, emojis, or intro notes."
     )
 
+    # 1. Primary: Gemini Flash (Google GenAI)
+    client = get_gemini_client()
+    if client:
+        candidate_models = [
+            GEMINI_MODEL,
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-flash-latest"
+        ]
+        candidate_models = list(dict.fromkeys(candidate_models))
+
+        contents = []
+        if history:
+            for msg in history[-4:]:
+                role = "user" if msg["role"] == "user" else "model"
+                contents.append(genai_types.Content(
+                    role=role,
+                    parts=[genai_types.Part.from_text(text=msg["content"])]
+                ))
+        contents.append(genai_types.Content(
+            role="user",
+            parts=[genai_types.Part.from_text(text=user_input)]
+        ))
+
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.85,
+            max_output_tokens=100
+        )
+
+        for model in candidate_models:
+            try:
+                res = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config
+                )
+                if res and res.text:
+                    reply = res.text.strip()
+                    if reply:
+                        return reply
+            except Exception as e:
+                print(f"⚠️  Gemini ({model}) error: {e}")
+
+    # 2. Fallback: Groq LPU API
     messages = [{"role": "system", "content": system_prompt}]
     if history:
         messages.extend(history[-4:])
     messages.append({"role": "user", "content": user_input})
 
-    # 1. Primary: Groq ultra-fast LPU API
     if GROQ_API_KEY:
         groq_url = "https://api.groq.com/openai/v1/chat/completions"
         groq_headers = {
@@ -534,9 +600,9 @@ def ask_groq(user_input, history=None):
                     if reply:
                         return reply
             except Exception as e:
-                print(f"⚠️  Groq ({model}) error: {e}")
+                print(f"⚠️  Groq ({model}) fallback error: {e}")
 
-    # 2. Fallback: xAI Grok
+    # 3. Fallback: xAI Grok
     if GROK_API_KEY:
         try:
             grok_url = "https://api.x.ai/v1/chat/completions"
@@ -562,7 +628,7 @@ def ask_groq(user_input, history=None):
         except Exception as e:
             print(f"⚠️  xAI Grok fallback error: {e}")
 
-    # 3. Emergency fallback rhyme so the battle NEVER hangs
+    # 4. Emergency fallback rhyme so the battle NEVER hangs
     print("⚡ Using emergency battle comeback bar...")
     emergency_fallbacks = [
         "You spitting fire or is my network slow?\nEither way I'm the king of this whole rap show!",
@@ -573,12 +639,12 @@ def ask_groq(user_input, history=None):
     return random.choice(emergency_fallbacks)
 
 
-# Alias for backward compatibility
-ask_grok = ask_groq
+ask_groq = ask_gemini
+ask_grok = ask_gemini
 
 
 def handle_rap_interaction(prompt, arduino, osc_client, voice_name, history):
-    """Send user input to Groq, display on LCD, and speak with Python TTS."""
+    """Send user input to Gemini Flash, display on LCD, and speak with Python TTS."""
     print(f"\n🎤 Heard: \"{prompt}\"")
     prompt_clean = " ".join(prompt.strip().split())
     if len(prompt_clean) > 36:
@@ -586,14 +652,14 @@ def handle_rap_interaction(prompt, arduino, osc_client, voice_name, history):
     else:
         prompt_display = prompt_clean
 
-    print("\n🤖 Machine (Groq) is writing bars in response...")
+    print("\n🤖 Machine (Gemini Flash) is writing bars in response...")
     update_lcd(arduino, f"You: {prompt_display}\nMachine thinking...")
 
-    reply = ask_groq(prompt, history)
+    reply = ask_gemini(prompt, history)
     if reply:
         history.append({"role": "user", "content": prompt})
         history.append({"role": "assistant", "content": reply})
-        print(f"\n🔥 Machine (Groq):\n{reply}\n")
+        print(f"\n🔥 Machine (Gemini Flash):\n{reply}\n")
 
         # 1. Update LCD screen (auto-scrolls if long)
         if arduino and arduino.is_open:
@@ -742,19 +808,19 @@ def transcribe_audio(audio_data, whisper_model=None, language=DEFAULT_WHISPER_LA
     return None
 
 
-def groq_start_battle(arduino, osc_client, voice_name, history):
+def gemini_start_battle(arduino, osc_client, voice_name, history):
     """
     Called when button on Pin 9 is pressed.
-    Groq says hi, welcomes the user to the battle, and drops the opening freestyle rap bars!
+    Gemini says hi, welcomes the user to the battle, and drops the opening freestyle rap bars!
     """
-    print("\n🚀 [START BUTTON PIN 9 PRESSED!] Initializing rap battle...")
+    print("\n🚀 [START BUTTON PIN 9 PRESSED!] Initializing Gemini rap battle...")
     if arduino and arduino.is_open:
         update_lcd(arduino, "Machine Entering Stage\nGet ready to rap...")
 
     system_prompt = (
         "You are an energetic freestyle rap battle host and opponent MC. "
         "You are dropping the opening bars over a 4/4 boom-bap beat at 96 BPM. "
-        "Start the battle right now! Challenge the user to step up to the mic. "
+        "Start the battle right now! Challenge the user to step up to the mic.\n"
         "RHYTHM AND METER RULES:\n"
         "- Exactly 2 rhyming bars (couplet).\n"
         "- Each line MUST have 8 to 10 syllables (around 6 to 8 words per line) to fit a 4-beat musical measure.\n"
@@ -766,8 +832,37 @@ def groq_start_battle(arduino, osc_client, voice_name, history):
 
     intro_reply = None
 
-    # 1. Primary: Groq LPU API
-    if GROQ_API_KEY:
+    # 1. Primary: Gemini Flash
+    client = get_gemini_client()
+    if client:
+        candidate_models = [
+            GEMINI_MODEL,
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-flash-latest"
+        ]
+        candidate_models = list(dict.fromkeys(candidate_models))
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.85,
+            max_output_tokens=100
+        )
+        for model in candidate_models:
+            try:
+                res = client.models.generate_content(
+                    model=model,
+                    contents="Start the rap battle now with 2 fire opening bars!",
+                    config=config
+                )
+                if res and res.text:
+                    intro_reply = res.text.strip()
+                    if intro_reply:
+                        break
+            except Exception as e:
+                print(f"⚠️  Gemini start error ({model}): {e}")
+
+    # 2. Fallback: Groq LPU API
+    if not intro_reply and GROQ_API_KEY:
         try:
             groq_url = "https://api.groq.com/openai/v1/chat/completions"
             groq_headers = {
@@ -790,7 +885,7 @@ def groq_start_battle(arduino, osc_client, voice_name, history):
         except Exception as e:
             print(f"⚠️  Groq start error: {e}")
 
-    # 2. Fallback: xAI Grok
+    # 3. Fallback: xAI Grok
     if not intro_reply and GROK_API_KEY:
         try:
             res = requests.post(
@@ -818,7 +913,7 @@ def groq_start_battle(arduino, osc_client, voice_name, history):
     history.clear()
     history.append({"role": "assistant", "content": intro_reply})
 
-    print(f"\n🔥 Machine (Groq) Intro:\n{intro_reply}\n")
+    print(f"\n🔥 Machine (Gemini Flash) Intro:\n{intro_reply}\n")
 
     # 1. Update LCD screen (auto-scrolls)
     if arduino and arduino.is_open:
@@ -837,15 +932,17 @@ def groq_start_battle(arduino, osc_client, voice_name, history):
         play_host_wav("finish_line")
 
 
-grok_start_battle = groq_start_battle
+groq_start_battle = gemini_start_battle
+grok_start_battle = gemini_start_battle
 
 
 
 def main():
-    global BEAT_VOLUME, GROK_VOLUME, UHH_VOLUME, GROK_MODEL, GROQ_MODEL
+    global BEAT_VOLUME, GROK_VOLUME, UHH_VOLUME, GROK_MODEL, GROQ_MODEL, GEMINI_MODEL
 
-    parser = argparse.ArgumentParser(description="Groq AI Rap Battle with Arduino & Whisper STT")
-    parser.add_argument("--groq-model", type=str, default=GROQ_MODEL, help=f"Groq LLM model (default: {GROQ_MODEL}, e.g. qwen/qwen3.8-27b, openai/gpt-oss-20b)")
+    parser = argparse.ArgumentParser(description="Gemini Flash AI Rap Battle with Arduino & Whisper STT")
+    parser.add_argument("--gemini-model", type=str, default=GEMINI_MODEL, help=f"Gemini LLM model (default: {GEMINI_MODEL}, e.g. gemini-2.5-flash, gemini-2.0-flash)")
+    parser.add_argument("--groq-model", type=str, default=GROQ_MODEL, help=f"Groq LLM model (default: {GROQ_MODEL}, e.g. openai/gpt-oss-120b)")
     parser.add_argument("--model", type=str, default=GROK_MODEL, help=f"Fallback xAI Grok model (default: {GROK_MODEL}, e.g. grok-3-mini, grok-3)")
     parser.add_argument("--voice", type=str, default=DEFAULT_VOICE, help=f"Voice identifier (default: {DEFAULT_VOICE})")
     parser.add_argument("--port", type=str, default=None, help="Serial port for Arduino LCD")
@@ -861,6 +958,7 @@ def main():
     BEAT_VOLUME = args.beat_volume
     GROK_VOLUME = args.grok_volume
     UHH_VOLUME = args.uhh_volume
+    GEMINI_MODEL = args.gemini_model
     GROQ_MODEL = args.groq_model
     GROK_MODEL = args.model
 
@@ -872,8 +970,8 @@ def main():
     whisper_lang = args.whisper_lang
 
     print("=" * 60)
-    print("🔥 GROQ AI RAP BATTLE (LPU INFERENCE + ARDUINO LCD)")
-    print(f"   LLM: Groq ({GROQ_MODEL}) [Fallback: xAI {GROK_MODEL}]")
+    print("🔥 GEMINI FLASH AI RAP BATTLE (GOOGLE GENAI + ARDUINO LCD)")
+    print(f"   LLM: Gemini ({GEMINI_MODEL}) [Fallbacks: Groq {GROQ_MODEL} / xAI {GROK_MODEL}]")
     print(f"   STT: Whisper ({whisper_model_name}, lang: {whisper_lang}) | Audio: Python TTS")
     print(f"   Volumes: Beat={BEAT_VOLUME} | Voice={GROK_VOLUME} | FX={UHH_VOLUME}")
     print("=" * 60)
@@ -1150,7 +1248,7 @@ def main():
                 update_lcd(arduino, "Mic Active\nSpit your verse...")
                 recorder.start()
 
-            # Step 3: Mic switched OFF -> Stop recording and send verse to Grok
+            # Step 3: Mic switched OFF -> Stop recording and send verse to Gemini Flash
             elif not mic_active and is_recording:
                 is_recording = False
                 is_busy = True
@@ -1203,7 +1301,7 @@ def main():
             if arduino and arduino.is_open:
                 send_to_arduino(arduino, "ALL_OFF")
                 send_to_arduino(arduino, "CLEAR")
-                send_to_arduino(arduino, "LINE:0:Groq Offline")
+                send_to_arduino(arduino, "LINE:0:Gemini Offline")
                 arduino.close()
             break
 
