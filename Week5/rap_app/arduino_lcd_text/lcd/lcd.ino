@@ -68,14 +68,30 @@ void calculatePartition(int manVotes, int machineVotes, int &manLeds, int &machi
     machineLeds = 3;
     return;
   }
-  float manShare = (float)manVotes / (float)total;
-  float machineShare = (float)machineVotes / (float)total;
-  manLeds = round(manShare * 3.0);
-  machineLeds = round(machineShare * 3.0);
-  if (manVotes > 0 && manLeds < 1) manLeds = 1;
-  if (machineVotes > 0 && machineLeds < 1) machineLeds = 1;
-  manLeds = constrain(manLeds, 0, 3);
-  machineLeds = constrain(machineLeds, 0, 3);
+  // Only if both parties received the same votes: equal LEDs (2 and 2)
+  if (manVotes == machineVotes) {
+    manLeds = 2;
+    machineLeds = 2;
+    return;
+  }
+  // Party with more votes always shows more LEDs (at least +1 LED)
+  if (manVotes > machineVotes) {
+    if (manVotes >= 3 * machineVotes) {
+      manLeds = 3;
+      machineLeds = 1;
+    } else {
+      manLeds = 2;
+      machineLeds = 1;
+    }
+  } else {
+    if (machineVotes >= 3 * manVotes) {
+      machineLeds = 3;
+      manLeds = 1;
+    } else {
+      machineLeds = 2;
+      manLeds = 1;
+    }
+  }
 }
 
 void updatePartition(int manVotes, int machineVotes) {

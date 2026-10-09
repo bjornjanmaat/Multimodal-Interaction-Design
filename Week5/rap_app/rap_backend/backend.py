@@ -394,30 +394,37 @@ def fetch_supabase_votes(url=None, key=None):
 def compute_partition_leds(man_votes, machine_votes):
     """
     Calculate 0-3 LED partition for Man (pins 4, 5, 6) and Machine (pins 10, 11, 12).
-    - If a party has 0 votes, 0 LEDs.
-    - If 100% of votes, 3 LEDs.
-    - If both have votes, proportional partition rounded to 0-3 with at least 1 LED.
+    - If total == 0: 0, 0 LEDs.
+    - If one party has 100% of votes: 3 LEDs for winner, 0 for loser.
+    - Only if both parties received the same votes (e.g. 4 to 4, 2 to 2):
+        both parties have the SAME amount of LEDs (2, 2).
+    - If one party has more votes:
+        the party with more votes ALWAYS shows more LEDs (at least +1 LED).
+        E.g. in 2 to 1 votes: 2 LEDs for the leader and 1 LED for the trailer.
     """
     total = man_votes + machine_votes
     if total <= 0:
         return 0, 0
+
+    # 100% of votes
     if machine_votes == 0:
         return 3, 0
     if man_votes == 0:
         return 0, 3
 
-    man_share = man_votes / total
-    machine_share = machine_votes / total
+    # Only if both parties received the same votes: equal LEDs (2 and 2)
+    if man_votes == machine_votes:
+        return 2, 2
 
-    man_leds = round(man_share * 3.0)
-    machine_leds = round(machine_share * 3.0)
-
-    if man_votes > 0 and man_leds < 1:
-        man_leds = 1
-    if machine_votes > 0 and machine_leds < 1:
-        machine_leds = 1
-
-    return max(0, min(3, int(man_leds))), max(0, min(3, int(machine_leds)))
+    # If one party has more votes, always show more LEDs for the leader
+    if man_votes > machine_votes:
+        if man_votes >= 3 * machine_votes:
+            return 3, 1
+        return 2, 1
+    else:
+        if machine_votes >= 3 * man_votes:
+            return 1, 3
+        return 1, 2
 
 
 def trigger_round_vote_leds(arduino, osc_client=None):
@@ -442,6 +449,7 @@ def trigger_round_vote_leds(arduino, osc_client=None):
     print("═" * 58 + "\n")
 
     if arduino and arduino.is_open:
+        send_to_arduino(arduino, f"LEDS:{man_leds},{machine_leds}")
         send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
 
     if osc_client:
@@ -468,11 +476,13 @@ def start_vote_polling(arduino, osc_client=None, poll_interval=1.5):
             total, machine_count, man_count, _ = fetch_supabase_votes()
             if total is not None:
                 man_leds, machine_leds = compute_partition_leds(man_count, machine_count)
+                print(f"💡 [Votes Fetched] LEDs shown: 🧑 Man: {man_leds}/3 LEDs ({man_count} votes) | 🤖 Machine: {machine_leds}/3 LEDs ({machine_count} votes) (Total: {total})")
                 if last_total is None:
                     last_total = total
                     last_man_leds = man_leds
                     last_machine_leds = machine_leds
                     if arduino and arduino.is_open:
+                        send_to_arduino(arduino, f"LEDS:{man_leds},{machine_leds}")
                         send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
                 elif total > last_total:
                     diff = total - last_total
@@ -480,6 +490,7 @@ def start_vote_polling(arduino, osc_client=None, poll_interval=1.5):
                     if arduino and arduino.is_open:
                         send_to_arduino(arduino, f"NEW_VOTE:{diff}")
                         time.sleep(diff * 0.15)
+                        send_to_arduino(arduino, f"LEDS:{man_leds},{machine_leds}")
                         send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
                     if osc_client:
                         try:
@@ -492,6 +503,7 @@ def start_vote_polling(arduino, osc_client=None, poll_interval=1.5):
                 elif man_leds != last_man_leds or machine_leds != last_machine_leds:
                     print(f"📊 [PARTITION SHIFT] Man: {last_man_leds}→{man_leds}/3 | Machine: {last_machine_leds}→{machine_leds}/3")
                     if arduino and arduino.is_open:
+                        send_to_arduino(arduino, f"LEDS:{man_leds},{machine_leds}")
                         send_to_arduino(arduino, f"VOTES:{man_count},{machine_count}")
                     last_man_leds = man_leds
                     last_machine_leds = machine_leds
