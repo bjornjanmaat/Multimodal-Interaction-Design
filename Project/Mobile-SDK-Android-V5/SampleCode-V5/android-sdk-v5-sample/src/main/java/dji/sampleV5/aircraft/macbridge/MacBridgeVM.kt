@@ -3,12 +3,16 @@ package dji.sampleV5.aircraft.macbridge
 import android.os.Handler
 import android.os.Looper
 import androidx.lifecycle.MutableLiveData
+import dji.sampleV5.aircraft.models.BasicAircraftControlVM
 import dji.sampleV5.aircraft.models.DJIViewModel
+import dji.v5.ux.core.util.ToastUtils
 import dji.sdk.keyvalue.key.BatteryKey
 import dji.sdk.keyvalue.key.FlightControllerKey
+import dji.sdk.keyvalue.value.common.EmptyMsg
+import dji.sdk.keyvalue.value.flightcontroller.FlightControlAuthority
+import dji.sdk.keyvalue.value.flightcontroller.FlightControlAuthorityChangeReason
 import dji.v5.common.callback.CommonCallbacks
 import dji.v5.common.error.IDJIError
-import dji.v5.et.action
 import dji.v5.et.cancelListen
 import dji.v5.et.create
 import dji.v5.et.listen
@@ -23,11 +27,11 @@ import dji.v5.manager.datacenter.livestream.LiveStreamStatusListener
 import dji.v5.manager.datacenter.livestream.LiveStreamType
 import dji.v5.manager.datacenter.livestream.settings.RtspSettings
 import dji.v5.manager.interfaces.ILiveStreamManager
-import dji.sdk.keyvalue.value.flightcontroller.FlightControlAuthorityChangeReason
 import dji.v5.utils.common.LogUtils
 import org.json.JSONObject
 import java.util.Timer
 import java.util.TimerTask
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -56,6 +60,12 @@ class MacBridgeVM : DJIViewModel(), MacBridgeServer.Listener {
     private var batteryPercent: Int = 0
     private var isConnected: Boolean = false
 
+    private var flightAuthorityOwner: FlightControlAuthority = FlightControlAuthority.UNKNOWN
+    private var lastAuthorityReason: FlightControlAuthorityChangeReason = FlightControlAuthorityChangeReason.UNKNOWN
+    private var lastStickLogTime: Long = 0L
+    private var lastBlockedLogTime: Long = 0L
+    private var isAutoEnabling: Boolean = false
+
     private val liveStreamManager: ILiveStreamManager = MediaDataCenter.getInstance().liveStreamManager
     private val server = MacBridgeServer(port = 9090, deadmanTimeoutMs = 500L)
     private var telemetryTimer: Timer? = null
@@ -76,20 +86,27 @@ class MacBridgeVM : DJIViewModel(), MacBridgeServer.Listener {
 
     private val virtualStickListener = object : VirtualStickStateListener {
         override fun onVirtualStickStateUpdate(stickState: VirtualStickState) {
+            flightAuthorityOwner = stickState.currentFlightControlAuthorityOwner
             mainHandler.post {
                 isVirtualStickEnabled.value = stickState.isVirtualStickEnable
                 server.isWatchdogActive = stickState.isVirtualStickEnable
             }
+            addLog("VirtualStick state: isEnable=${stickState.isVirtualStickEnable}, owner=${stickState.currentFlightControlAuthorityOwner}")
         }
 
         override fun onChangeReasonUpdate(reason: FlightControlAuthorityChangeReason) {
-            addLog("Flight control authority reason: $reason")
+            lastAuthorityReason = reason
+            addLog("VirtualStick authority reason: $reason")
         }
     }
+
+    private val basicAircraftControlVM = BasicAircraftControlVM()
 
     init {
         server.listener = this
         initDroneListeners()
+        // Ensure baseline speedLevel is set (default is 0.0 in SDK)
+        VirtualStickManager.getInstance().speedLevel = 0.8
         VirtualStickManager.getInstance().setVirtualStickStateListener(virtualStickListener)
         liveStreamManager.addLiveStreamStatusListener(liveStreamStatusListener)
     }
@@ -134,7 +151,7 @@ class MacBridgeVM : DJIViewModel(), MacBridgeServer.Listener {
             }
 
             override fun onFailure(error: IDJIError) {
-                addLog("RTSP Stream start failed: ${error.description()}")
+                addLog("RTSP Stream start failed: ${error.description() ?: error.toString()} (code: ${error.errorCode()})")
             }
         })
     }
@@ -150,32 +167,38 @@ class MacBridgeVM : DJIViewModel(), MacBridgeServer.Listener {
             }
 
             override fun onFailure(error: IDJIError) {
-                addLog("RTSP Stream stop failed: ${error.description()}")
+                addLog("RTSP Stream stop failed: ${error.description() ?: error.toString()} (code: ${error.errorCode()})")
             }
         })
     }
 
     fun enableVirtualStick() {
+        addLog("Requesting Virtual Stick authority from DJI Flight Controller...")
         VirtualStickManager.getInstance().enableVirtualStick(object : CommonCallbacks.CompletionCallback {
             override fun onSuccess() {
+                VirtualStickManager.getInstance().speedLevel = 0.8
                 mainHandler.post { isVirtualStickEnabled.value = true }
                 server.isWatchdogActive = true
-                addLog("Virtual Stick enabled.")
+                ToastUtils.showToast("Virtual Stick ENABLED (Speed 0.8)")
+                addLog("SUCCESS: Virtual Stick authority GRANTED! Ready for Mac control.")
             }
 
             override fun onFailure(error: IDJIError) {
-                addLog("Enable Virtual Stick failed: ${error.description() ?: error.toString()} (code: ${error.errorCode()})")
+                ToastUtils.showToast("Enable Virtual Stick Failed: ${error.errorCode()}")
+                addLog("ERROR: Enable Virtual Stick failed: ${error.description() ?: error.toString()} [code: ${error.errorCode()}]")
             }
         })
     }
 
     fun disableVirtualStick() {
         resetSticks()
+        addLog("Disabling Virtual Stick authority...")
         VirtualStickManager.getInstance().disableVirtualStick(object : CommonCallbacks.CompletionCallback {
             override fun onSuccess() {
                 mainHandler.post { isVirtualStickEnabled.value = false }
                 server.isWatchdogActive = false
-                addLog("Virtual Stick disabled.")
+                ToastUtils.showToast("Virtual Stick Disabled")
+                addLog("Virtual Stick authority revoked / disabled.")
             }
 
             override fun onFailure(error: IDJIError) {
@@ -185,22 +208,53 @@ class MacBridgeVM : DJIViewModel(), MacBridgeServer.Listener {
     }
 
     fun takeOff() {
-        FlightControllerKey.KeyStartTakeoff.create().action({
-            addLog("Takeoff initiated successfully.")
-        }, { error ->
-            val code = error.errorCode()
-            val desc = error.description() ?: error.toString()
-            addLog("Takeoff failed: $desc [code: $code]")
+        // If Virtual Stick is enabled, auto-takeoff action will be rejected by firmware.
+        if (isVirtualStickEnabled.value == true) {
+            addLog("Disabling Virtual Stick authority prior to takeoff...")
+            VirtualStickManager.getInstance().disableVirtualStick(object : CommonCallbacks.CompletionCallback {
+                override fun onSuccess() {
+                    mainHandler.post { isVirtualStickEnabled.value = false }
+                    mainHandler.postDelayed({ executeTakeOff() }, 200L)
+                }
+                override fun onFailure(error: IDJIError) {
+                    mainHandler.postDelayed({ executeTakeOff() }, 200L)
+                }
+            })
+        } else {
+            executeTakeOff()
+        }
+    }
+
+    private fun executeTakeOff() {
+        basicAircraftControlVM.startTakeOff(object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+            override fun onSuccess(t: EmptyMsg?) {
+                ToastUtils.showToast("Takeoff Success! Auto-enabling Virtual Stick in 4s...")
+                addLog("Takeoff initiated successfully! Drone is ascending...")
+                // Automatically enable Virtual Stick once the drone reaches hover height (~4 seconds)
+                mainHandler.postDelayed({
+                    addLog("Auto-enabling Virtual Stick now that drone is hovering...")
+                    enableVirtualStick()
+                }, 4000L)
+            }
+
+            override fun onFailure(error: IDJIError) {
+                ToastUtils.showToast("Takeoff Failed: ${error.errorCode()}")
+                addLog("Takeoff failed: ${error.description() ?: error.toString()} [code: ${error.errorCode()}]")
+            }
         })
     }
 
     fun land() {
-        FlightControllerKey.KeyStartAutoLanding.create().action({
-            addLog("Auto landing initiated.")
-        }, { error ->
-            val code = error.errorCode()
-            val desc = error.description() ?: error.toString()
-            addLog("Landing failed: $desc [code: $code]")
+        basicAircraftControlVM.startLanding(object : CommonCallbacks.CompletionCallbackWithParam<EmptyMsg> {
+            override fun onSuccess(t: EmptyMsg?) {
+                ToastUtils.showToast("Landing Success")
+                addLog("Auto landing initiated.")
+            }
+
+            override fun onFailure(error: IDJIError) {
+                ToastUtils.showToast("Landing Failed: ${error.errorCode()}")
+                addLog("Landing failed: ${error.description() ?: error.toString()} [code: ${error.errorCode()}]")
+            }
         })
     }
 
@@ -219,11 +273,13 @@ class MacBridgeVM : DJIViewModel(), MacBridgeServer.Listener {
     }
 
     fun resetSticks() {
-        val stickManager = VirtualStickManager.getInstance()
-        stickManager.leftStick.horizontalPosition = 0
-        stickManager.leftStick.verticalPosition = 0
-        stickManager.rightStick.horizontalPosition = 0
-        stickManager.rightStick.verticalPosition = 0
+        try {
+            val stickManager = VirtualStickManager.getInstance()
+            stickManager.leftStick.horizontalPosition = 0
+            stickManager.leftStick.verticalPosition = 0
+            stickManager.rightStick.horizontalPosition = 0
+            stickManager.rightStick.verticalPosition = 0
+        } catch (_: Exception) {}
 
         mainHandler.post {
             lastStickValues.value = "Pitch: 0.00  Roll: 0.00  Yaw: 0.00  Throttle: 0.00 (Neutral)"
@@ -270,17 +326,49 @@ class MacBridgeVM : DJIViewModel(), MacBridgeServer.Listener {
         val clampedYaw = max(-1.0f, min(1.0f, yaw))
         val clampedThrottle = max(-1.0f, min(1.0f, throttle))
 
-        val stickManager = VirtualStickManager.getInstance()
-        stickManager.rightStick.verticalPosition = (clampedPitch * Stick.MAX_STICK_POSITION_ABS).toInt()
-        stickManager.rightStick.horizontalPosition = (clampedRoll * Stick.MAX_STICK_POSITION_ABS).toInt()
-        stickManager.leftStick.horizontalPosition = (clampedYaw * Stick.MAX_STICK_POSITION_ABS).toInt()
-        stickManager.leftStick.verticalPosition = (clampedThrottle * Stick.MAX_STICK_POSITION_ABS).toInt()
-
         mainHandler.post {
             lastStickValues.value = String.format(
                 "Pitch: %.2f  Roll: %.2f  Yaw: %.2f  Throttle: %.2f",
                 clampedPitch, clampedRoll, clampedYaw, clampedThrottle
             )
+        }
+
+        val hasInput = abs(clampedPitch) > 0.05f || abs(clampedRoll) > 0.05f ||
+                       abs(clampedYaw) > 0.05f || abs(clampedThrottle) > 0.05f
+
+        val isEnabled = isVirtualStickEnabled.value == true
+
+        if (isEnabled) {
+            val stickManager = VirtualStickManager.getInstance()
+            if (stickManager.speedLevel < 0.5) {
+                stickManager.speedLevel = 0.8
+            }
+            val pInt = (clampedPitch * Stick.MAX_STICK_POSITION_ABS).toInt()
+            val rInt = (clampedRoll * Stick.MAX_STICK_POSITION_ABS).toInt()
+            val yInt = (clampedYaw * Stick.MAX_STICK_POSITION_ABS).toInt()
+            val tInt = (clampedThrottle * Stick.MAX_STICK_POSITION_ABS).toInt()
+
+            stickManager.rightStick.verticalPosition = pInt
+            stickManager.rightStick.horizontalPosition = rInt
+            stickManager.leftStick.horizontalPosition = yInt
+            stickManager.leftStick.verticalPosition = tInt
+
+            val now = System.currentTimeMillis()
+            if (hasInput && (now - lastStickLogTime > 1500L)) {
+                lastStickLogTime = now
+                addLog("✈️ Stick -> FC: P=$pInt, R=$rInt, Y=$yInt, T=$tInt (Speed=${stickManager.speedLevel})")
+            }
+        } else {
+            val now = System.currentTimeMillis()
+            if (hasInput && (now - lastBlockedLogTime > 2000L)) {
+                lastBlockedLogTime = now
+                addLog("⚠️ STICK DROPPED: Virtual Stick authority is NOT active (owner: ${flightAuthorityOwner.name}, isFlying: $isFlying). Auto-enabling...")
+                if (!isAutoEnabling) {
+                    isAutoEnabling = true
+                    enableVirtualStick()
+                    mainHandler.postDelayed({ isAutoEnabling = false }, 3000L)
+                }
+            }
         }
     }
 
@@ -325,6 +413,8 @@ class MacBridgeVM : DJIViewModel(), MacBridgeServer.Listener {
                             put("isFlying", isFlying)
                             put("isMotorsOn", areMotorsOn)
                             put("virtualStickEnabled", isVirtualStickEnabled.value ?: false)
+                            put("authorityOwner", flightAuthorityOwner.name)
+                            put("speedLevel", VirtualStickManager.getInstance().speedLevel)
                             put("rtspStreaming", isRtspStreaming.value ?: false)
                             put("rtspUrl", rtspUrl.value ?: "")
                             put("timestamp", System.currentTimeMillis())
@@ -357,7 +447,19 @@ class MacBridgeVM : DJIViewModel(), MacBridgeServer.Listener {
             areMotorsOn = motors ?: false
         }
         FlightControllerKey.KeyIsFlying.create().listen(this) { flying ->
+            val wasFlying = isFlying
             isFlying = flying ?: false
+            if (!wasFlying && isFlying) {
+                addLog("✈️ Drone is now FLYING! Scheduling auto-enable of Virtual Stick in 3.5s...")
+                mainHandler.postDelayed({
+                    if (isFlying && isVirtualStickEnabled.value != true) {
+                        addLog("Drone hovering after takeoff. Auto-enabling Virtual Stick authority...")
+                        enableVirtualStick()
+                    }
+                }, 3500L)
+            } else if (wasFlying && !isFlying) {
+                addLog("Drone has landed.")
+            }
         }
         BatteryKey.KeyChargeRemainingInPercent.create().listen(this) { pct ->
             batteryPercent = pct ?: 0

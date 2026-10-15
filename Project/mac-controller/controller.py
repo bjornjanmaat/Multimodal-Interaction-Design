@@ -112,6 +112,8 @@ class DroneBridgeClient:
             msg = json.loads(line)
             if msg.get("type") == "telemetry":
                 with self.lock:
+                    prev_vs = self.telemetry.get("virtualStickEnabled", False)
+                    prev_owner = self.telemetry.get("authorityOwner", "")
                     self.telemetry["connected"] = msg.get("connected", False)
                     self.telemetry["battery"] = msg.get("battery", 0)
                     self.telemetry["altitude"] = msg.get("altitude", 0.0)
@@ -119,8 +121,16 @@ class DroneBridgeClient:
                     self.telemetry["isFlying"] = msg.get("isFlying", False)
                     self.telemetry["isMotorsOn"] = msg.get("isMotorsOn", False)
                     self.telemetry["virtualStickEnabled"] = msg.get("virtualStickEnabled", False)
+                    self.telemetry["authorityOwner"] = msg.get("authorityOwner", "UNKNOWN")
+                    self.telemetry["speedLevel"] = msg.get("speedLevel", 0.8)
                     self.telemetry["rtspUrl"] = msg.get("rtspUrl", "")
                     self.telemetry["lastUpdate"] = time.time()
+
+                    cur_vs = self.telemetry["virtualStickEnabled"]
+                    cur_owner = self.telemetry["authorityOwner"]
+                    if cur_vs != prev_vs or cur_owner != prev_owner:
+                        state_str = "ENABLED [MSDK Flight Authority]" if cur_vs else f"DISABLED [Authority Owner: {cur_owner}]"
+                        print(f"[DRONE TELEMETRY] Virtual Stick is now: {state_str}")
             elif msg.get("type") == "log":
                 log_txt = msg.get("message", "")
                 with self.lock:
@@ -142,6 +152,7 @@ class DroneBridgeClient:
 
     def _control_loop(self):
         """Continuously sends stick commands at ~20 Hz."""
+        last_tx_log = 0.0
         while self.running:
             if self.connected:
                 with self.lock:
@@ -152,11 +163,30 @@ class DroneBridgeClient:
                         "yaw": round(float(self.yaw), 3),
                         "throttle": round(float(self.throttle), 3)
                     }
+                    vs_enabled = self.telemetry.get("virtualStickEnabled", False)
+                    authority = self.telemetry.get("authorityOwner", "UNKNOWN")
+
+                has_input = (abs(cmd["pitch"]) > 0.05 or abs(cmd["roll"]) > 0.05 or 
+                             abs(cmd["yaw"]) > 0.05 or abs(cmd["throttle"]) > 0.05)
+
+                now = time.time()
+                if has_input and (now - last_tx_log > 1.2):
+                    last_tx_log = now
+                    if vs_enabled:
+                        print(f"[STICK TX] ✈️ Flying -> Pitch: {cmd['pitch']:+.2f}, Roll: {cmd['roll']:+.2f}, Yaw: {cmd['yaw']:+.2f}, Throttle: {cmd['throttle']:+.2f}")
+                    else:
+                        print(f"[STICK WARNING] ⚠️ Movement sent (P:{cmd['pitch']:+.2f} R:{cmd['roll']:+.2f}), but Virtual Stick is DISABLED on drone [Owner: {authority}]! Press 'E' to enable.")
+
                 self.send_command(cmd)
             time.sleep(0.05) # 20 Hz
 
     def takeoff(self):
         print("[ACTION] Requesting Takeoff...")
+        with self.lock:
+            self.pitch = 0.0
+            self.roll = 0.0
+            self.yaw = 0.0
+            self.throttle = 0.0
         self.send_command({"cmd": "takeoff"})
 
     def land(self):
@@ -181,8 +211,23 @@ class DroneBridgeClient:
         print("[ACTION] Emergency Hover triggered (all sticks zeroed).")
 
     def arm_motors(self):
-        print("[ACTION] Requesting CSC Motor Arm (Spin Up Motors)...")
-        self.send_command({"cmd": "arm_motors"})
+        def _csc_routine():
+            print("[ACTION] CSC Arm: Holding sticks down-inward for 2.0s to spin up motors...")
+            # Left stick: Throttle Down (-1.0), Yaw CW (+1.0)
+            # Right stick: Pitch Down (-1.0), Roll Left (-1.0)
+            with self.lock:
+                self.throttle = -1.0
+                self.yaw = 1.0
+                self.pitch = -1.0
+                self.roll = -1.0
+            time.sleep(2.0)
+            with self.lock:
+                self.throttle = 0.0
+                self.yaw = 0.0
+                self.pitch = 0.0
+                self.roll = 0.0
+            print("[ACTION] CSC finished: Sticks returned to neutral.")
+        threading.Thread(target=_csc_routine, daemon=True).start()
 
 
 class VideoReceiver:
@@ -261,8 +306,13 @@ def draw_hud(frame, telemetry, bridge_client):
 
     # Virtual Stick Status Indicator
     vs_on = telemetry.get("virtualStickEnabled", False)
-    vs_txt = "STICK: ENABLED" if vs_on else "STICK: DISABLED (Press E)"
-    vs_col = (0, 255, 0) if vs_on else (0, 140, 255)
+    owner = telemetry.get("authorityOwner", "RC")
+    if vs_on:
+        vs_txt = "STICK: ENABLED [MSDK]"
+        vs_col = (0, 255, 0) # Green
+    else:
+        vs_txt = f"STICK: DISABLED [{owner}] (Press E)"
+        vs_col = (0, 100, 255) # Bright Orange/Red
     cv2.putText(overlay, vs_txt, (260, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.55, vs_col, 2)
 
     # Center: Flight Mode & Motors
@@ -280,18 +330,27 @@ def draw_hud(frame, telemetry, bridge_client):
     last_log = telemetry.get("lastLog")
     if last_log:
         cv2.rectangle(overlay, (0, 50), (w, 80), (10, 10, 10), -1)
-        cv2.putText(overlay, f"STATUS: {last_log}", (20, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        cv2.putText(overlay, f"STATUS: {last_log}", (20, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1)
+
+    # Airborne but Virtual Stick Disabled Warning Banner
+    if telemetry.get("isFlying") and not vs_on:
+        cv2.rectangle(overlay, (cx - 320, 90), (cx + 320, 135), (0, 0, 160), -1)
+        cv2.putText(overlay, "CONTROLS INACTIVE: PRESS 'E' TO ENABLE VIRTUAL STICK", 
+                    (cx - 300, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     # Bottom Stick Input Gauge Overlay
-    bw, bh = 220, 90
+    bw, bh = 240, 105
     bx, by = 20, h - bh - 20
     cv2.rectangle(overlay, (bx, by), (bx + bw, by + bh), (30, 30, 30), -1)
     cv2.putText(overlay, "INPUT METERS", (bx + 10, by + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
     cv2.putText(overlay, f"P: {bridge_client.pitch:+.2f}  R: {bridge_client.roll:+.2f}", (bx + 10, by + 46), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
-    cv2.putText(overlay, f"Y: {bridge_client.yaw:+.2f}  T: {bridge_client.throttle:+.2f}", (bx + 10, by + 74), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+    cv2.putText(overlay, f"Y: {bridge_client.yaw:+.2f}  T: {bridge_client.throttle:+.2f}", (bx + 10, by + 72), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+    status_label = "ACTIVE (MSDK)" if vs_on else "DISABLED (Press E)"
+    status_color = (0, 255, 0) if vs_on else (0, 140, 255)
+    cv2.putText(overlay, f"STICK: {status_label}", (bx + 10, by + 95), cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
 
     # Controls Helper
-    cv2.putText(overlay, "W/S: Pitch | A/D: Roll | Up/Dn: Throttle | Left/Rt: Yaw | Space: Takeoff | C: Arm | L: Land | E: Stick | X: Hover", 
+    cv2.putText(overlay, "W/S: Pitch | A/D: Roll | Up/Dn or I/K: Throttle | Left/Rt or J/L: Yaw | Space: Takeoff | V: Land | E: Stick | X: Hover", 
                 (bx + bw + 20, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1)
 
     # Blend overlay with original frame for subtle transparency
@@ -363,7 +422,7 @@ def main():
     print("   [LEFT] / [RIGHT]  : Yaw Rotate CCW / CW (or J / L)")
     print("   [SPACE]           : Auto Takeoff")
     print("   [C]               : Arm Motors (CSC stick gesture)")
-    print("   [L]               : Auto Landing")
+    print("   [V] / [BACKSPACE] : Auto Landing")
     print("   [E]               : Enable Virtual Stick Authority")
     print("   [X] / [ESC]       : Emergency Hover (Neutralize all sticks)")
     print("   [Q]               : Quit Application")
@@ -396,8 +455,8 @@ def main():
                     elif event.key == pygame.K_SPACE:
                         print("[KEY] SPACE -> Auto Takeoff")
                         client.takeoff()
-                    elif event.key == pygame.K_l:
-                        print("[KEY] L -> Auto Landing")
+                    elif event.key == pygame.K_v or event.key == pygame.K_BACKSPACE:
+                        print("[KEY] V -> Auto Landing")
                         client.land()
                     elif event.key == pygame.K_e:
                         print("[KEY] E -> Enable Virtual Stick")
