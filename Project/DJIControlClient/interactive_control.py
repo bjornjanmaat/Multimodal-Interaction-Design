@@ -59,7 +59,7 @@ def main():
     parser = argparse.ArgumentParser(description="DJI Control Client Terminal Controller")
     parser.add_argument("--host", default="127.0.0.1", help="Server IP / Host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="Server Port (default: 8080)")
-    parser.add_argument("--step", type=float, default=0.20, help="Step distance in meters (default: 0.20 = 20cm)")
+    parser.add_argument("--step", type=float, default=0.10, help="Step distance in meters (default: 0.10 = 10cm)")
     parser.add_argument("--speed", type=float, default=0.5, help="Max Speed in m/s (default: 0.5)")
     args = parser.parse_args()
 

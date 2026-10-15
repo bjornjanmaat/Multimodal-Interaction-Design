@@ -1,0 +1,12 @@
+Key	Action
+W / S	Move Forward / Backward (by step distance, default 20cm)
+A / D	Move Left / Right (by step distance)
+U / J (or Up / Down)	Move Up / Down (by step distance)
+Q / E (or Left / Right)	Rotate Counter-Clockwise / Clockwise (30°)
+T or Space	Initiate Auto-Takeoff
+L	Initiate Auto-Landing
+C	Confirm Landing
+P	Capture Photo
++ / -	Increase / Decrease step distance (+/- 5cm)
+V	Toggle HUD Overlay On / Off
+Esc or X	Quit Controller
