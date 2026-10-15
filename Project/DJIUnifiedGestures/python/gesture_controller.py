@@ -118,7 +118,7 @@ def init_mediapipe_recognizer(model_path):
     return GestureRecognizer.create_from_options(options)
 
 
-def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, last_action=""):
+def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, last_action=""):
     """Draws rich aviation HUD with gesture indicators directly onto video frame."""
     h, w, _ = frame.shape
     overlay = frame.copy()
@@ -148,14 +148,21 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
     step_txt = f"STEP: {step_cm}cm ({step_dist:.2f}m)"
     cv2.putText(overlay, step_txt, (w - 240, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
 
+    # Dry Run / Movement Disabled Warning Banner
+    if not movement_enabled:
+        cv2.rectangle(overlay, (cx - 250, 54), (cx + 250, 86), (0, 140, 255), -1)
+        cv2.putText(overlay, "DRY RUN MODE: MOVEMENT LOCKED [Press M to Unlock]", (cx - 235, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 2)
+
     # --- Gesture Recognition HUD Card (Top Left) ---
-    card_x, card_y, card_w, card_h = 20, 65, 360, 110
+    card_x, card_y, card_w, card_h = 20, 65, 380, 110
     cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (25, 25, 30), -1)
     cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (80, 80, 80), 1)
 
     label = gesture_info.get("label", "None")
     score = gesture_info.get("score", 0.0)
     action = gesture_info.get("action", "HOVER")
+
+    sim_suffix = " [SIMULATED]" if not movement_enabled else ""
 
     if estop:
         g_badge = "GESTURES: PAUSED (E-STOP)"
@@ -170,13 +177,13 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
     else:
         if label == "Thumb_Up":
             g_badge = f"👍 THUMB UP ({score:.0%})"
-            g_color = (0, 255, 0)
-            action_txt = f"ACTION: CLIMBING (+{step_cm}cm)"
-            action_color = (0, 255, 0)
+            g_color = (0, 255, 0) if movement_enabled else (0, 200, 255)
+            action_txt = f"ACTION: CLIMBING (+{step_cm}cm){sim_suffix}"
+            action_color = (0, 255, 0) if movement_enabled else (0, 200, 255)
         elif label == "Thumb_Down":
             g_badge = f"👎 THUMB DOWN ({score:.0%})"
             g_color = (0, 140, 255)
-            action_txt = f"ACTION: DESCENDING (-{step_cm}cm)"
+            action_txt = f"ACTION: DESCENDING (-{step_cm}cm){sim_suffix}"
             action_color = (0, 140, 255)
         else:
             g_badge = f"HAND: {label} ({score:.0%})" if label != "None" else "HAND: None (Hovering)"
@@ -185,7 +192,7 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
             action_color = (220, 220, 220)
 
     cv2.putText(overlay, g_badge, (card_x + 12, card_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, g_color, 2)
-    cv2.putText(overlay, action_txt, (card_x + 12, card_y + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.60, action_color, 2)
+    cv2.putText(overlay, action_txt, (card_x + 12, card_y + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.58, action_color, 2)
 
     # Indicator light
     ind_color = g_color if (gesture_enabled and not estop) else (0, 0, 255)
@@ -193,8 +200,8 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
 
     # Bottom Control Bar
     cv2.rectangle(overlay, (0, h - 45), (w, h), (20, 20, 20), -1)
-    controls_txt = "[SPACE] E-Stop | [G] Toggle Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land | [+/-] Step | [Esc] Exit"
-    cv2.putText(overlay, controls_txt, (20, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+    controls_txt = "[M] Move Lock | [SPACE] E-Stop | [G] Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land | [+/-] Step | [Esc] Exit"
+    cv2.putText(overlay, controls_txt, (15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 200, 200), 1)
 
     # Last Action Banner
     if last_action:
@@ -236,6 +243,7 @@ def main():
     parser.add_argument("--min-score", type=float, default=0.65, help="Minimum gesture recognition confidence (default: 0.65)")
     parser.add_argument("--hold-time", type=float, default=0.25, help="Debounce hold time in seconds (default: 0.25)")
     parser.add_argument("--rtsp", default="", help="Custom RTSP URL (leave empty to auto-detect)")
+    parser.add_argument("--dry-run", action="store_true", help="Start with drone movement disabled (dry run mode)")
     args = parser.parse_args()
 
     # Parse host
@@ -335,12 +343,17 @@ def main():
 
     estop = False              # Emergency Stop toggle
     gesture_enabled = True     # Gesture control enable toggle
+    movement_enabled = not args.dry_run  # Physical drone movement toggle
     last_command_time = 0.0
     command_interval = 0.70    # Rate limiter between step triggers (700ms)
     action_in_flight = False
 
-    def do_action(action_fn, desc):
+    def do_action(action_fn, desc, is_movement=True):
         nonlocal last_action, action_in_flight
+        if is_movement and not movement_enabled:
+            last_action = f"[DRY RUN SIMULATED] {desc}"
+            print(f">> {last_action} (Movement locked - press 'M' to enable)")
+            return
         if action_in_flight:
             return
         action_in_flight = True
@@ -366,6 +379,7 @@ def main():
     print("GESTURE & KEYBOARD CONTROLS:")
     print("  [👍 Thumb Up]    Climb (Move Up by step distance)")
     print("  [👎 Thumb Down]  Descend (Move Down by step distance)")
+    print("  [M]              Toggle Drone Movement ON/OFF (Dry Run Mode)")
     print("  [SPACE]          E-Stop / Pause Gesture Control")
     print("  [G]              Toggle Gesture Tracking On/Off")
     print("  [W / S / A / D]  Manual Pitch & Roll")
@@ -432,7 +446,7 @@ def main():
                     gesture_info["action"] = "PAUSED"
 
             # Draw HUD
-            hud_frame = draw_hud(display_frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, last_action)
+            hud_frame = draw_hud(display_frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, last_action)
             cv2.imshow(window_name, hud_frame)
 
             # Key check
@@ -441,6 +455,11 @@ def main():
             if key in (27, ord('x'), ord('X')):
                 print("Exit requested. Quitting...")
                 break
+
+            elif key in (ord('m'), ord('M')):
+                movement_enabled = not movement_enabled
+                last_action = "DRONE MOVEMENT ENABLED (Live Flight)" if movement_enabled else "DRONE MOVEMENT DISABLED (Dry Run)"
+                print(f"\n>> {last_action}\n")
 
             elif key == ord(' '):
                 estop = not estop
@@ -486,7 +505,7 @@ def main():
                 do_action(lambda: client.confirmLanding(), "Confirm Landing")
 
             elif key in (ord('p'), ord('P')):
-                do_action(lambda: client.captureShot(), "Capture Photo")
+                do_action(lambda: client.captureShot(), "Capture Photo", is_movement=False)
 
             elif key in (ord('+'), ord('=')):
                 step_dist = round(step_dist + 0.05, 2)
