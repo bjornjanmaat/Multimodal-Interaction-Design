@@ -12,6 +12,12 @@
         tools:layout="@layout/frag_virtual_stick_page" />
 
     <fragment
+        android:id="@+id/mac_bridge_page"
+        android:name="dji.sampleV5.aircraft.pages.MacBridgeFragment"
+        android:label="mac_bridge_page"
+        tools:layout="@layout/frag_mac_bridge_page" />
+
+    <fragment
         android:id="@+id/flight_record_page"
         android:name="dji.sampleV5.aircraft.pages.FlightRecordFragment"
         android:label="flight_record_page"

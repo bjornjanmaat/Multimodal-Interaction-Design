@@ -37,6 +37,9 @@ More refer to the release notes." </string>
     <string name="item_virtual_stick_title">Virtual Stick</string>
     <string name="item_virtual_description">Demonstrate how to use the virtual stick function</string>
 
+    <string name="item_mac_bridge_title">Mac Controller Bridge</string>
+    <string name="item_mac_bridge_description">Live stream video to Mac and control the drone using Mac inputs</string>
+
     <string name="item_handheld_title">Handheld</string>
     <string name="item_handheld_description">Demonstrate how to use the handheld function</string>
 
