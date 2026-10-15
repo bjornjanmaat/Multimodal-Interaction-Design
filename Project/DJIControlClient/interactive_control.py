@@ -60,7 +60,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Server IP / Host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="Server Port (default: 8080)")
     parser.add_argument("--step", type=float, default=0.10, help="Step distance in meters (default: 0.10 = 10cm)")
-    parser.add_argument("--speed", type=float, default=0.5, help="Max Speed in m/s (default: 0.5)")
+    parser.add_argument("--speed", type=float, default=0.3, help="Max Speed in m/s (default: 0.3)")
     args = parser.parse_args()
 
     # Clean up host input in case user passes "http://ip" or "ip:8080"
