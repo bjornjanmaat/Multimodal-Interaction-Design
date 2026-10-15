@@ -33,3 +33,25 @@ application.windows64/
 **/.DS_Store
 temp/
 **/temp/
+
+# Android & Gradle
+.gradle/
+**/.gradle/
+build/
+**/build/
+captures/
+**/captures/
+.externalNativeBuild/
+**/.externalNativeBuild/
+.cxx/
+**/.cxx/
+*.apk
+**/*.apk
+*.aab
+**/*.aab
+local.properties
+**/local.properties
+.idea/
+**/.idea/
+*.iml
+**/*.iml
