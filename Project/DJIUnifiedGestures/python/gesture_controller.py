@@ -28,8 +28,9 @@ import time
 import threading
 import argparse
 
-# Suppress noisy FFmpeg macroblock decode warnings
+# Suppress noisy FFmpeg macroblock decode warnings and force TCP transport for robust RTSP
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 import cv2
 import numpy as np
@@ -42,13 +43,15 @@ from DJIControlClient import DJIControlClient, ControlMode
 
 class VideoReceiver:
     """Manages the RTSP video stream in a background thread."""
-    def __init__(self, rtsp_url):
+    def __init__(self, rtsp_url, client=None):
         self.rtsp_url = rtsp_url
+        self.client = client
         self.cap = None
         self.frame = None
         self.running = False
         self.lock = threading.Lock()
         self.connected = False
+        self.last_start_attempt = 0.0
 
     def start(self):
         self.running = True
@@ -69,12 +72,27 @@ class VideoReceiver:
                 continue
 
             if self.cap is None or not self.cap.isOpened():
+                now = time.time()
+                # If disconnected, check phone live stream state every 5 seconds
+                if self.client and (now - self.last_start_attempt > 5.0):
+                    self.last_start_attempt = now
+                    try:
+                        info = self.client.getLiveStreamInfo()
+                        if not info.get("streaming"):
+                            print("[VIDEO] Requesting phone to start live stream...")
+                            self.client.startLiveStream()
+                            time.sleep(1.0)
+                        if info.get("url") and info["url"] != self.rtsp_url:
+                            self.update_url(info["url"])
+                    except Exception:
+                        pass
+
                 print(f"[VIDEO] Connecting to RTSP Stream: {self.rtsp_url}")
                 self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             ret, frame = self.cap.read()
-            if ret:
+            if ret and frame is not None and frame.size > 0:
                 self.connected = True
                 with self.lock:
                     self.frame = frame
@@ -295,25 +313,32 @@ def main():
     recognizer = init_mediapipe_recognizer(model_path)
     print("MediaPipe Gesture Recognizer loaded successfully!")
 
-    # Determine RTSP stream URL
+    # Determine RTSP stream URL & ensure stream is active
     rtsp_url = args.rtsp
-    if not rtsp_url:
-        try:
+    try:
+        print("Checking live video stream on drone...")
+        stream_info = client.getLiveStreamInfo()
+        if not stream_info.get("streaming"):
+            print("Requesting Android app to start RTSP live stream...")
+            res = client.startLiveStream()
+            print(f"Start live stream response: {res}")
+            time.sleep(1.5)
             stream_info = client.getLiveStreamInfo()
-            if isinstance(stream_info, dict) and stream_info.get("url"):
-                raw_url = stream_info.get("url")
-                if host in ("127.0.0.1", "localhost"):
-                    rtsp_url = "rtsp://admin:123456@127.0.0.1:8554/streaming/live/1"
-                else:
-                    rtsp_url = raw_url
-        except Exception:
-            pass
+
+        if not rtsp_url and isinstance(stream_info, dict) and stream_info.get("url"):
+            raw_url = stream_info.get("url")
+            if host in ("127.0.0.1", "localhost"):
+                rtsp_url = "rtsp://admin:123456@127.0.0.1:8554/streaming/live/1"
+            else:
+                rtsp_url = raw_url
+    except Exception as e:
+        print(f"Notice querying live stream: {e}")
 
     if not rtsp_url:
         rtsp_url = f"rtsp://admin:123456@{host}:8554/streaming/live/1"
 
     print(f"Starting Video Receiver on: {rtsp_url}")
-    video = VideoReceiver(rtsp_url)
+    video = VideoReceiver(rtsp_url, client=client)
     video.start()
 
     # Telemetry State

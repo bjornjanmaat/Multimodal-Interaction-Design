@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.text.format.Formatter
 import android.util.Log
+import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -41,8 +42,12 @@ import dji.v5.manager.interfaces.SDKManagerCallback
 import dji.v5.utils.inner.SDKConfig
 import dji.v5.manager.datacenter.MediaDataCenter
 import dji.v5.manager.datacenter.livestream.LiveStreamSettings
+import dji.v5.manager.datacenter.livestream.LiveStreamStatus
+import dji.v5.manager.datacenter.livestream.LiveStreamStatusListener
 import dji.v5.manager.datacenter.livestream.LiveStreamType
+import dji.v5.manager.datacenter.livestream.StreamQuality
 import dji.v5.manager.datacenter.livestream.settings.RtspSettings
+import dji.v5.manager.interfaces.ICameraStreamManager
 
 import io.ktor.application.*
 import io.ktor.features.*
@@ -120,11 +125,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var droneNameText: TextView
     private lateinit var batteryText: TextView
     private lateinit var rtspText: TextView
+    private lateinit var btnToggleStream: Button
 
     private val RTSP_PORT = 8554
     private val RTSP_USER = "admin"
     private val RTSP_PASS = "123456"
     private var isRtspStreaming = false
+    private var currentCameraIndex = ComponentIndexType.LEFT_OR_MAIN
+    private val availableCameras = mutableListOf<ComponentIndexType>()
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -173,6 +181,15 @@ class MainActivity : AppCompatActivity() {
         droneNameText = findViewById(R.id.droneNameText)
         batteryText = findViewById(R.id.batteryText)
         rtspText = findViewById(R.id.rtspText)
+        btnToggleStream = findViewById(R.id.btnToggleStream)
+
+        btnToggleStream.setOnClickListener {
+            if (isRtspStreaming) {
+                stopLiveStream()
+            } else {
+                startLiveStream()
+            }
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, 1)
@@ -229,63 +246,113 @@ class MainActivity : AppCompatActivity() {
             val ip = getDeviceIpAddress()
             val url = "rtsp://$RTSP_USER:$RTSP_PASS@$ip:$RTSP_PORT/streaming/live/1"
             rtspText.text = getString(R.string.rtsp_streaming, url)
+            if (::btnToggleStream.isInitialized) {
+                btnToggleStream.text = "Stop Video Stream"
+                btnToggleStream.setBackgroundColor(0xFFFF3B30.toInt())
+            }
         } else {
             rtspText.text = getString(R.string.rtsp_stopped)
+            if (::btnToggleStream.isInitialized) {
+                btnToggleStream.text = "Start Video Stream"
+                btnToggleStream.setBackgroundColor(0xFF007AFF.toInt())
+            }
         }
     }
 
     // --- RTSP Live Video Streaming ---
 
     private fun startLiveStream(port: Int = RTSP_PORT, username: String = RTSP_USER, pass: String = RTSP_PASS, callback: ((Boolean, String?) -> Unit)? = null) {
-        val liveStreamManager = MediaDataCenter.getInstance().liveStreamManager
-        val rtspSettings = RtspSettings.Builder()
-            .setUserName(username)
-            .setPassWord(pass)
-            .setPort(port)
-            .build()
+        mainHandler.post {
+            try {
+                val liveStreamManager = MediaDataCenter.getInstance().liveStreamManager
+                if (liveStreamManager.isStreaming) {
+                    isRtspStreaming = true
+                    val ip = getDeviceIpAddress()
+                    val url = "rtsp://$username:$pass@$ip:$port/streaming/live/1"
+                    Log.i(TAG, "RTSP Live Stream already active: $url")
+                    updateRtspUI()
+                    callback?.invoke(true, url)
+                    return@post
+                }
 
-        val settings = LiveStreamSettings.Builder()
-            .setLiveStreamType(LiveStreamType.RTSP)
-            .setRtspSettings(rtspSettings)
-            .build()
+                // Explicitly set camera index
+                liveStreamManager.cameraIndex = currentCameraIndex
+                try {
+                    liveStreamManager.liveStreamQuality = StreamQuality.HD
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Notice setting liveStreamQuality: ${e.message}")
+                }
 
-        liveStreamManager.liveStreamSettings = settings
-        liveStreamManager.startStream(object : CommonCallbacks.CompletionCallback {
-            override fun onSuccess() {
-                isRtspStreaming = true
-                val ip = getDeviceIpAddress()
-                val url = "rtsp://$username:$pass@$ip:$port/streaming/live/1"
-                Log.i(TAG, "RTSP Live Stream started successfully: $url")
-                runOnUiThread { updateRtspUI() }
-                callback?.invoke(true, url)
+                val rtspSettings = RtspSettings.Builder()
+                    .setUserName(username)
+                    .setPassWord(pass)
+                    .setPort(port)
+                    .build()
+
+                val settings = LiveStreamSettings.Builder()
+                    .setLiveStreamType(LiveStreamType.RTSP)
+                    .setRtspSettings(rtspSettings)
+                    .build()
+
+                liveStreamManager.liveStreamSettings = settings
+                liveStreamManager.startStream(object : CommonCallbacks.CompletionCallback {
+                    override fun onSuccess() {
+                        isRtspStreaming = true
+                        val ip = getDeviceIpAddress()
+                        val url = "rtsp://$username:$pass@$ip:$port/streaming/live/1"
+                        Log.i(TAG, "RTSP Live Stream started successfully: $url")
+                        runOnUiThread {
+                            updateRtspUI()
+                            showToast("RTSP Video Stream Started")
+                        }
+                        callback?.invoke(true, url)
+                    }
+
+                    override fun onFailure(error: IDJIError) {
+                        isRtspStreaming = false
+                        val msg = "RTSP Start Failed: ${error.description()} (${error.errorCode()})"
+                        Log.e(TAG, msg)
+                        runOnUiThread {
+                            updateRtspUI()
+                            showToast(msg)
+                        }
+                        callback?.invoke(false, msg)
+                    }
+                })
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception during startLiveStream", e)
+                callback?.invoke(false, e.message)
             }
-
-            override fun onFailure(error: IDJIError) {
-                isRtspStreaming = false
-                val msg = "RTSP Start Failed: ${error.description()} (${error.errorCode()})"
-                Log.e(TAG, msg)
-                runOnUiThread { updateRtspUI() }
-                callback?.invoke(false, msg)
-            }
-        })
+        }
     }
 
     private fun stopLiveStream(callback: ((Boolean, String?) -> Unit)? = null) {
-        val liveStreamManager = MediaDataCenter.getInstance().liveStreamManager
-        liveStreamManager.stopStream(object : CommonCallbacks.CompletionCallback {
-            override fun onSuccess() {
-                isRtspStreaming = false
-                Log.i(TAG, "RTSP Live Stream stopped")
-                runOnUiThread { updateRtspUI() }
-                callback?.invoke(true, null)
-            }
+        mainHandler.post {
+            try {
+                val liveStreamManager = MediaDataCenter.getInstance().liveStreamManager
+                liveStreamManager.stopStream(object : CommonCallbacks.CompletionCallback {
+                    override fun onSuccess() {
+                        isRtspStreaming = false
+                        Log.i(TAG, "RTSP Live Stream stopped")
+                        runOnUiThread {
+                            updateRtspUI()
+                            showToast("RTSP Video Stream Stopped")
+                        }
+                        callback?.invoke(true, null)
+                    }
 
-            override fun onFailure(error: IDJIError) {
-                val msg = "RTSP Stop Failed: ${error.description()} (${error.errorCode()})"
-                Log.e(TAG, msg)
-                callback?.invoke(false, msg)
+                    override fun onFailure(error: IDJIError) {
+                        val msg = "RTSP Stop Failed: ${error.description()} (${error.errorCode()})"
+                        Log.e(TAG, msg)
+                        runOnUiThread { showToast(msg) }
+                        callback?.invoke(false, msg)
+                    }
+                })
+            } catch (e: Exception) {
+                Log.e(TAG, "Exception during stopLiveStream", e)
+                callback?.invoke(false, e.message)
             }
-        })
+        }
     }
 
     private fun startServer() {
@@ -324,6 +391,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 Log.i(TAG, "DJI MSDK V5 Registered successfully!")
                 setupTelemetryListeners()
+                setupCameraAndLiveStreamListeners()
             }
 
             override fun onRegisterFailure(error: IDJIError) {
@@ -335,11 +403,13 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onProductConnect(productId: Int) {
+                Log.i(TAG, "onProductConnect: $productId")
                 runOnUiThread { updateDroneConnectionUI(true) }
                 startLiveStream()
             }
 
             override fun onProductDisconnect(productId: Int) {
+                Log.i(TAG, "onProductDisconnect: $productId")
                 runOnUiThread { updateDroneConnectionUI(false) }
                 stopLiveStream()
             }
@@ -358,10 +428,59 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    private fun setupCameraAndLiveStreamListeners() {
+        try {
+            MediaDataCenter.getInstance().cameraStreamManager.addAvailableCameraUpdatedListener(object : ICameraStreamManager.AvailableCameraUpdatedListener {
+                override fun onAvailableCameraUpdated(list: MutableList<ComponentIndexType>) {
+                    Log.i(TAG, "Available cameras updated: $list")
+                    availableCameras.clear()
+                    availableCameras.addAll(list)
+                    if (list.isNotEmpty()) {
+                        currentCameraIndex = list[0]
+                        MediaDataCenter.getInstance().liveStreamManager.cameraIndex = currentCameraIndex
+                        Log.i(TAG, "Updated currentCameraIndex to $currentCameraIndex")
+                    }
+                }
+
+                override fun onCameraStreamEnableUpdate(cameraStreamEnableMap: MutableMap<ComponentIndexType, Boolean>) {
+                    Log.i(TAG, "Camera stream enable update: $cameraStreamEnableMap")
+                }
+            })
+        } catch (e: Throwable) {
+            Log.e(TAG, "Error registering availableCameraUpdatedListener", e)
+        }
+
+        try {
+            MediaDataCenter.getInstance().liveStreamManager.addLiveStreamStatusListener(object : LiveStreamStatusListener {
+                override fun onLiveStreamStatusUpdate(status: LiveStreamStatus?) {
+                    val streaming = status?.isStreaming ?: false
+                    if (isRtspStreaming != streaming) {
+                        isRtspStreaming = streaming
+                        runOnUiThread { updateRtspUI() }
+                    }
+                }
+
+                override fun onError(error: IDJIError?) {
+                    Log.e(TAG, "LiveStreamStatus error: ${error?.description()} (${error?.errorCode()})")
+                }
+            })
+        } catch (e: Throwable) {
+            Log.e(TAG, "Error registering liveStreamStatusListener", e)
+        }
+    }
+
     private fun setupTelemetryListeners() {
         KeyManager.getInstance().listen(KeyTools.createKey(FlightControllerKey.KeyConnection), this) { _, conn ->
             isConnected = conn ?: false
             runOnUiThread { updateDroneConnectionUI(isConnected) }
+            if (isConnected && !isRtspStreaming) {
+                mainHandler.postDelayed({
+                    if (isConnected && !isRtspStreaming) {
+                        Log.i(TAG, "Drone connection active; initiating RTSP live stream...")
+                        startLiveStream()
+                    }
+                }, 1500)
+            }
         }
 
         KeyManager.getInstance().listen(KeyTools.createKey(FlightControllerKey.KeyAltitude), this) { _, alt ->
@@ -603,6 +722,17 @@ class MainActivity : AppCompatActivity() {
                 "url" to url,
                 "ip" to ip,
                 "port" to RTSP_PORT
+            )))
+        }
+
+        get("/getCameraInfo") {
+            val liveStreamManager = MediaDataCenter.getInstance().liveStreamManager
+            call.respond(DroneState(mapOf(
+                "availableCameras" to availableCameras.map { it.name },
+                "currentCameraIndex" to currentCameraIndex.name,
+                "isStreaming" to (liveStreamManager.isStreaming),
+                "isRtspStreaming" to isRtspStreaming,
+                "streamQuality" to (liveStreamManager.liveStreamQuality?.name ?: "UNKNOWN")
             )))
         }
     }

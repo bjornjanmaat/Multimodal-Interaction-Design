@@ -91,6 +91,19 @@
         app:layout_constraintTop_toBottomOf="@+id/ipText"
         tools:text="RTSP: rtsp://admin:123456@192.168.1.100:8554/streaming/live/1" />
 
+    <Button
+        android:id="@+id/btnToggleStream"
+        android:layout_width="240dp"
+        android:layout_height="48dp"
+        android:layout_marginTop="16dp"
+        android:backgroundTint="#007AFF"
+        android:text="Start Video Stream"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@+id/rtspText" />
+
     <TextView
         android:id="@+id/regText"
         android:layout_width="wrap_content"
