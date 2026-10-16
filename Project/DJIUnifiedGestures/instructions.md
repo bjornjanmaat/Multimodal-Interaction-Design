@@ -61,7 +61,16 @@ Navigate to the `python/` directory:
 cd "/Users/bjornjanmaat/Developer/Multimodal Interaction Design/projects/Project/DJIUnifiedGestures/python"
 ```
 
-### Mode 1: Safe Dry-Run Mode (Recommended First)
+### Mode 0: Local Simulator Mode (No Drone Needed - Laptop Camera)
+*Test your hand gestures and virtual drone controls anytime directly using your Mac's built-in webcam. No drone, Android app, or Wi-Fi network required!*
+```bash
+./run_simulator.sh
+```
+*(Or run: `./run.sh --sim`)*
+
+---
+
+### Mode 1: Safe Dry-Run Mode (With Real Drone Connected)
 *Recognizes gestures from the live camera stream and shows simulated movements without physically flying the drone.*
 ```bash
 ./run.sh --host <PHONE_IP> --dry-run

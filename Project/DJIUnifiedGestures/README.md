@@ -20,8 +20,9 @@ DJIUnifiedGestures/
 │   └── build.gradle
 ├── python/                  # MediaPipe Gesture Recognition & Flight Controller
 │   ├── gesture_controller.py # Real-time RTSP Stream Scanner + Gesture Flight HUD
-│   ├── DJIControlClient.py   # HTTP REST Client for DJI Flight Control
+│   ├── DJIControlClient.py   # HTTP REST Client & Simulator Mock for DJI Flight Control
 │   ├── gesture_recognizer.task # Pre-trained MediaPipe Gesture Model
+│   ├── run_simulator.sh      # Launch simulator with laptop camera (no drone needed)
 │   ├── run.sh                # Launcher using 'myenv' virtual environment
 │   ├── setup_usb_forwarding.sh
 │   └── requirements.txt
@@ -33,7 +34,18 @@ DJIUnifiedGestures/
 
 ## Quickstart
 
-### 1. Launch the Android App
+### Option A: Simulator Mode (No Drone Needed - Laptop Camera)
+Test gestures and simulated drone flight using your Mac's built-in camera:
+```bash
+cd DJIUnifiedGestures/python
+./run_simulator.sh
+```
+
+---
+
+### Option B: Connect to Physical Drone
+
+#### 1. Launch the Android App
 Ensure your Android phone running `DJIUnifiedGestures` is connected to your drone and your local Wi-Fi (or USB).
 To install/launch via USB:
 ```bash
@@ -43,7 +55,7 @@ cd DJIUnifiedGestures
 
 ---
 
-### 2. Run the Gesture Controller (using `myenv`)
+#### 2. Run the Gesture Controller (using `myenv`)
 
 #### Over Wi-Fi:
 Use your phone's Wi-Fi IP (shown at the top of the app, e.g. `192.168.2.8`):

@@ -40,7 +40,62 @@ import mediapipe as mp
 
 # Add current directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from DJIControlClient import DJIControlClient, ControlMode
+from DJIControlClient import DJIControlClient, ControlMode, MockDJIControlClient
+
+
+class WebcamReceiver:
+    """Captures live video from the laptop's built-in camera for gesture simulation."""
+    def __init__(self, camera_index=0, mirror=True):
+        self.camera_index = camera_index
+        self.mirror = mirror
+        self.cap = None
+        self.frame = None
+        self.running = False
+        self.lock = threading.Lock()
+        self.connected = False
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+
+    def _capture_loop(self):
+        print(f"[WEBCAM] Opening laptop camera #{self.camera_index}...")
+        self.cap = cv2.VideoCapture(self.camera_index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+        # Allow warmup frames
+        for _ in range(5):
+            ret, frame = self.cap.read()
+            if ret and frame is not None and frame.size > 0:
+                break
+            time.sleep(0.1)
+
+        while self.running:
+            if self.cap is None or not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(self.camera_index)
+                time.sleep(0.5)
+
+            ret, frame = self.cap.read()
+            if ret and frame is not None and frame.size > 0:
+                if self.mirror:
+                    frame = cv2.flip(frame, 1)  # Horizontal mirror for intuitive gestures
+                self.connected = True
+                with self.lock:
+                    self.frame = frame
+            else:
+                self.connected = False
+                time.sleep(0.05)
+
+    def get_frame(self):
+        with self.lock:
+            return self.frame.copy() if self.frame is not None else None
+
+    def stop(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
 
 
 class VideoReceiver:
@@ -153,8 +208,12 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
     cv2.rectangle(overlay, (0, 0), (w, 50), (20, 20, 20), -1)
 
     # Drone Connection Status
-    dji_status = "CONNECTED" if telemetry["connected"] else "OFFLINE"
-    dji_color = (0, 255, 0) if telemetry["connected"] else (0, 0, 255)
+    if telemetry.get("simulator", False):
+        dji_status = "SIMULATOR (WEBCAM)"
+        dji_color = (255, 200, 0)
+    else:
+        dji_status = "CONNECTED" if telemetry["connected"] else "OFFLINE"
+        dji_color = (0, 255, 0) if telemetry["connected"] else (0, 0, 255)
     cv2.putText(overlay, f"DRONE: {dji_status}", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, dji_color, 2)
 
     # Telemetry: Altitude & Heading
@@ -311,7 +370,13 @@ def main():
     parser.add_argument("--hold-time", type=float, default=0.25, help="Debounce hold time in seconds (default: 0.25)")
     parser.add_argument("--rtsp", default="", help="Custom RTSP URL (leave empty to auto-detect)")
     parser.add_argument("--dry-run", action="store_true", help="Start with drone movement disabled (dry run mode)")
+    parser.add_argument("--sim", action="store_true", help="Run in simulator mode using laptop webcam (no drone needed)")
+    parser.add_argument("--webcam", action="store_true", help="Alias for --sim")
+    parser.add_argument("--camera", type=int, default=0, help="Laptop webcam device index (default: 0)")
+    parser.add_argument("--no-mirror", action="store_true", help="Disable horizontal flip (mirroring) on webcam")
     args = parser.parse_args()
+
+    is_simulator = args.sim or args.webcam
 
     # Parse host
     host = args.host.strip()
@@ -328,21 +393,31 @@ def main():
     else:
         port = args.port
 
-    print("=" * 65)
-    print("   DJI UNIFIED GESTURE CONTROLLER (MediaPipe Thumbs Up/Down)")
-    print("=" * 65)
-    print(f"Connecting to REST API at http://{host}:{port}...")
+    if is_simulator:
+        print("=" * 65)
+        print("   DJI GESTURE SIMULATOR (LAPTOP WEBCAM)")
+        print("=" * 65)
+        print("Initializing Virtual Drone & Local Simulation...")
+        client = MockDJIControlClient(ip="127.0.0.1", port=port)
+    else:
+        print("=" * 65)
+        print("   DJI UNIFIED GESTURE CONTROLLER (MediaPipe Thumbs Up/Down)")
+        print("=" * 65)
+        print(f"Connecting to REST API at http://{host}:{port}...")
 
-    try:
-        client = DJIControlClient(ip=host, port=port)
-        print("Connected to Flight REST Server successfully!")
-    except Exception as e:
-        print(f"\nConnection Error: {e}")
-        print("\nTroubleshooting:")
-        print("  1. Is the DJIUnifiedGestures Android app open on your phone?")
-        print("  2. If using Wi-Fi, pass: --host <PHONE_IP> (e.g. --host 192.168.2.8)")
-        print("  3. If using USB, run: ./setup_usb_forwarding.sh first")
-        sys.exit(1)
+        try:
+            client = DJIControlClient(ip=host, port=port)
+            print("Connected to Flight REST Server successfully!")
+        except Exception as e:
+            print(f"\nConnection Error: {e}")
+            print("\nTroubleshooting:")
+            print("  1. Is the DJIUnifiedGestures Android app open on your phone?")
+            print("  2. If using Wi-Fi, pass: --host <PHONE_IP> (e.g. --host 192.168.2.8)")
+            print("  3. If using USB, run: ./setup_usb_forwarding.sh first")
+            print("\n💡 Want to test without a drone? Run the Simulator using your laptop camera:")
+            print("   ./run_simulator.sh")
+            print("   or: ./run.sh --sim")
+            sys.exit(1)
 
     # Initialize drone flight mode
     step_dist = round(args.step, 2)
@@ -362,36 +437,44 @@ def main():
     recognizer = init_mediapipe_recognizer(model_path)
     print("MediaPipe Gesture Recognizer loaded successfully!")
 
-    # Determine RTSP stream URL & ensure stream is active
-    rtsp_url = args.rtsp
-    try:
-        print("Checking live video stream on drone...")
-        stream_info = client.getLiveStreamInfo()
-        if not stream_info.get("streaming"):
-            print("Requesting Android app to start RTSP live stream...")
-            res = client.startLiveStream()
-            print(f"Start live stream response: {res}")
-            time.sleep(1.5)
+    # Determine video source
+    if is_simulator:
+        mirror_mode = not args.no_mirror
+        print(f"Starting Laptop Camera Receiver #{args.camera} (Mirror: {mirror_mode})...")
+        video = WebcamReceiver(camera_index=args.camera, mirror=mirror_mode)
+        video.start()
+        rtsp_url = f"webcam://{args.camera}"
+    else:
+        # Determine RTSP stream URL & ensure stream is active
+        rtsp_url = args.rtsp
+        try:
+            print("Checking live video stream on drone...")
             stream_info = client.getLiveStreamInfo()
+            if not stream_info.get("streaming"):
+                print("Requesting Android app to start RTSP live stream...")
+                res = client.startLiveStream()
+                print(f"Start live stream response: {res}")
+                time.sleep(1.5)
+                stream_info = client.getLiveStreamInfo()
 
-        if not rtsp_url and isinstance(stream_info, dict) and stream_info.get("url"):
-            raw_url = stream_info.get("url")
-            if host in ("127.0.0.1", "localhost"):
-                rtsp_url = "rtsp://admin:123456@127.0.0.1:8554/streaming/live/1"
-            else:
-                rtsp_url = raw_url
-    except Exception as e:
-        print(f"Notice querying live stream: {e}")
+            if not rtsp_url and isinstance(stream_info, dict) and stream_info.get("url"):
+                raw_url = stream_info.get("url")
+                if host in ("127.0.0.1", "localhost"):
+                    rtsp_url = "rtsp://admin:123456@127.0.0.1:8554/streaming/live/1"
+                else:
+                    rtsp_url = raw_url
+        except Exception as e:
+            print(f"Notice querying live stream: {e}")
 
-    if not rtsp_url:
-        rtsp_url = f"rtsp://admin:123456@{host}:8554/streaming/live/1"
+        if not rtsp_url:
+            rtsp_url = f"rtsp://admin:123456@{host}:8554/streaming/live/1"
 
-    print(f"Starting Video Receiver on: {rtsp_url}")
-    video = VideoReceiver(rtsp_url, client=client)
-    video.start()
+        print(f"Starting Video Receiver on: {rtsp_url}")
+        video = VideoReceiver(rtsp_url, client=client)
+        video.start()
 
     # Telemetry State
-    telemetry = {"connected": True, "altitude": 0.0, "heading": 0.0}
+    telemetry = {"connected": True, "altitude": 0.0, "heading": 0.0, "simulator": is_simulator}
     running = True
 
     def telemetry_loop():
@@ -481,6 +564,13 @@ def main():
     cv2.resizeWindow(window_name, 1024, 576)
 
     print("\n" + "-" * 65)
+    if is_simulator:
+        print("   DJI GESTURE SIMULATOR (LAPTOP WEBCAM)")
+        print(f"   Camera: Device #{args.camera} (Mirrored) | Drone: Virtual Simulated Drone")
+    else:
+        print("   DJI LIVE FLIGHT CONTROLLER")
+        print(f"   Drone Host: {host}:{port} | Stream: {rtsp_url}")
+    print("-" * 65)
     print("GESTURE & KEYBOARD CONTROLS:")
     print("  [H]              Set Default Point (Anchors 50cm Safety Box)")
     print("  [K]              Clear Default Point")
@@ -498,13 +588,16 @@ def main():
     print("  [L]              Land")
     print("  [+ / -]          Step Distance (+/- 5cm)")
     print("  [Esc / X]        Exit")
-    print("-" * 65)
+    print("-" * 65 + "\n")
 
     try:
         while running:
             frame = video.get_frame()
             if frame is None:
-                display_frame = create_standby_frame(1024, 576, f"Waiting for Drone RTSP Stream: {rtsp_url}")
+                if is_simulator:
+                    display_frame = create_standby_frame(1024, 576, f"Waiting for Laptop Camera #{args.camera}...")
+                else:
+                    display_frame = create_standby_frame(1024, 576, f"Waiting for Drone RTSP Stream: {rtsp_url}")
             else:
                 display_frame = frame
 

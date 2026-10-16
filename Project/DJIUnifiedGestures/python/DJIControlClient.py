@@ -207,3 +207,117 @@ class DJIControlClient:
 
     def pitchGimbal(self, angle: float) -> Dict[str, Any]:
         return self.makeReqAndReturnJSON(f'/pitchGimbal/{angle}')
+
+
+class MockDJIControlClient:
+    """Mock DJI Control Client for local testing & simulation without physical drone."""
+    def __init__(self, ip: str = "127.0.0.1", port: int = 8080):
+        self.ip = ip
+        self.port = port
+        self.altitude = 0.0
+        self.heading = 0.0
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.is_flying = False
+        self.max_speed = 0.3
+        self.control_mode = ControlMode.POSITION
+        self.landing_protection = False
+        print("[SIMULATOR] Mock DJI Control Client initialized (Virtual Drone).")
+
+    def takeOff(self) -> Dict[str, Any]:
+        self.is_flying = True
+        self.altitude = 1.20
+        self.z = 1.20
+        print("[SIMULATOR] Virtual Drone: Takeoff -> Hovering at 1.20m")
+        return {"code": 0, "message": "Simulator: Takeoff Successful"}
+
+    def land(self) -> Dict[str, Any]:
+        self.is_flying = False
+        self.altitude = 0.0
+        self.z = 0.0
+        print("[SIMULATOR] Virtual Drone: Landing -> On Ground (0.00m)")
+        return {"code": 0, "message": "Simulator: Landed"}
+
+    def confirmLanding(self) -> Dict[str, Any]:
+        return {"code": 0, "message": "Simulator: Landing Confirmed"}
+
+    def captureShot(self) -> Dict[str, Any]:
+        print("[SIMULATOR] Virtual Drone: Snapshot captured")
+        return {"code": 0, "message": "Simulator: Snapshot Captured"}
+
+    def setControlMode(self, mode: ControlMode) -> Dict[str, Any]:
+        self.control_mode = mode
+        return {"code": 0, "message": "OK"}
+
+    def getControlMode(self) -> ControlMode:
+        return self.control_mode
+
+    def setMaxSpeed(self, speed: float) -> Dict[str, Any]:
+        self.max_speed = speed
+        return {"code": 0, "message": "OK"}
+
+    def getMaxSpeed(self) -> float:
+        return self.max_speed
+
+    def setLandingProtectionState(self, enabled: bool) -> Dict[str, Any]:
+        self.landing_protection = enabled
+        return {"code": 0, "message": "OK"}
+
+    def moveUp(self, distance: float) -> Dict[str, Any]:
+        self.altitude = round(self.altitude + distance, 2)
+        self.z = round(self.z + distance, 2)
+        print(f"[SIMULATOR] Virtual Drone: Move Up +{int(distance*100)}cm -> Alt: {self.altitude:.2f}m")
+        return {"code": 0, "state": "SUCCESS"}
+
+    def moveDown(self, distance: float) -> Dict[str, Any]:
+        self.altitude = max(0.0, round(self.altitude - distance, 2))
+        self.z = max(0.0, round(self.z - distance, 2))
+        print(f"[SIMULATOR] Virtual Drone: Move Down -{int(distance*100)}cm -> Alt: {self.altitude:.2f}m")
+        return {"code": 0, "state": "SUCCESS"}
+
+    def moveForward(self, distance: float) -> Dict[str, Any]:
+        self.x = round(self.x + distance, 2)
+        print(f"[SIMULATOR] Virtual Drone: Move Forward +{int(distance*100)}cm -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
+        return {"code": 0, "state": "SUCCESS"}
+
+    def moveBackward(self, distance: float) -> Dict[str, Any]:
+        self.x = round(self.x - distance, 2)
+        print(f"[SIMULATOR] Virtual Drone: Move Backward -{int(distance*100)}cm -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
+        return {"code": 0, "state": "SUCCESS"}
+
+    def moveLeft(self, distance: float) -> Dict[str, Any]:
+        self.y = round(self.y - distance, 2)
+        print(f"[SIMULATOR] Virtual Drone: Move Left -{int(distance*100)}cm -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
+        return {"code": 0, "state": "SUCCESS"}
+
+    def moveRight(self, distance: float) -> Dict[str, Any]:
+        self.y = round(self.y + distance, 2)
+        print(f"[SIMULATOR] Virtual Drone: Move Right +{int(distance*100)}cm -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
+        return {"code": 0, "state": "SUCCESS"}
+
+    def rotateClockwise(self, angle: float) -> Dict[str, Any]:
+        self.heading = (self.heading + angle) % 360.0
+        print(f"[SIMULATOR] Virtual Drone: Rotate CW {angle}° -> Heading: {self.heading:.1f}°")
+        return {"code": 0, "state": "SUCCESS"}
+
+    def rotateCounterClockwise(self, angle: float) -> Dict[str, Any]:
+        self.heading = (self.heading - angle) % 360.0
+        print(f"[SIMULATOR] Virtual Drone: Rotate CCW {angle}° -> Heading: {self.heading:.1f}°")
+        return {"code": 0, "state": "SUCCESS"}
+
+    def getAltitude(self) -> float:
+        return float(self.altitude)
+
+    def getHeading(self) -> float:
+        return float(self.heading)
+
+    def getLiveStreamInfo(self) -> Dict[str, Any]:
+        return {"streaming": True, "url": "webcam"}
+
+    def startLiveStream(self) -> Dict[str, Any]:
+        return {"code": 0, "message": "OK"}
+
+    def stopLiveStream(self) -> Dict[str, Any]:
+        return {"code": 0, "message": "OK"}
+
