@@ -2,12 +2,14 @@
 """
 DJI Unified Gesture Controller & Live Stream HUD
 =================================================
-Recognizes hand gestures (Thumbs Up / Thumbs Down) from the drone's live camera
-stream using Google MediaPipe to command drone vertical motion (Climb / Descend).
+Recognizes hand gestures (Thumbs Up / Thumbs Down / Open Palm / Closed Fist) from the drone's live camera
+stream using Google MediaPipe to command drone 3D motion:
 
 Controls:
   - Thumbs Up (👍)    -> Drone climbs (Up) by step distance
   - Thumbs Down (👎)  -> Drone descends (Down) by step distance
+  - Open Palm (✋)    -> Drone moves Backward by step distance
+  - Closed Fist (✊)  -> Drone moves Forward by step distance
   - No Hand / Neutral -> Drone hovers in place
   - Spacebar          -> Emergency Stop / Toggle Gesture Control
   - T                 -> Auto Takeoff
@@ -136,7 +138,7 @@ def init_mediapipe_recognizer(model_path):
     return GestureRecognizer.create_from_options(options)
 
 
-def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, last_action=""):
+def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, safety_info, last_action=""):
     """Draws rich aviation HUD with gesture indicators directly onto video frame."""
     h, w, _ = frame.shape
     overlay = frame.copy()
@@ -203,6 +205,16 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
             g_color = (0, 140, 255)
             action_txt = f"ACTION: DESCENDING (-{step_cm}cm){sim_suffix}"
             action_color = (0, 140, 255)
+        elif label == "Open_Palm":
+            g_badge = f"✋ OPEN PALM ({score:.0%})"
+            g_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
+            action_txt = f"ACTION: BACKWARD (-{step_cm}cm){sim_suffix}"
+            action_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
+        elif label == "Closed_Fist":
+            g_badge = f"✊ CLOSED FIST ({score:.0%})"
+            g_color = (255, 200, 0) if movement_enabled else (255, 230, 120)
+            action_txt = f"ACTION: FORWARD (+{step_cm}cm){sim_suffix}"
+            action_color = (255, 200, 0) if movement_enabled else (255, 230, 120)
         else:
             g_badge = f"HAND: {label} ({score:.0%})" if label != "None" else "HAND: None (Hovering)"
             g_color = (200, 200, 200)
@@ -216,14 +228,50 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
     ind_color = g_color if (gesture_enabled and not estop) else (0, 0, 255)
     cv2.circle(overlay, (card_x + card_w - 24, card_y + 30), 8, ind_color, -1)
 
+    # --- Safety Boundary Box HUD Card (Top Right) ---
+    safe_w, safe_h = 360, 110
+    safe_x, safe_y = max(card_x + card_w + 10, w - safe_w - 20), 65
+    cv2.rectangle(overlay, (safe_x, safe_y), (safe_x + safe_w, safe_y + safe_h), (25, 25, 30), -1)
+    cv2.rectangle(overlay, (safe_x, safe_y), (safe_x + safe_w, safe_y + safe_h), (80, 80, 80), 1)
+
+    max_cm = int(round(safety_info.get("max", 0.50) * 100))
+    if safety_info.get("set", False):
+        rx = int(round(safety_info.get("x", 0.0) * 100))
+        ry = int(round(safety_info.get("y", 0.0) * 100))
+        rz = int(round(safety_info.get("z", 0.0) * 100))
+        dist_cm = int(round(safety_info.get("dist", 0.0) * 100))
+
+        if dist_cm >= max_cm:
+            s_color = (0, 0, 255)
+            b_status = "LIMIT REACHED"
+        elif dist_cm >= int(max_cm * 0.75):
+            s_color = (0, 165, 255)
+            b_status = "NEAR BOUNDARY"
+        else:
+            s_color = (0, 255, 0)
+            b_status = "SAFE"
+
+        cv2.putText(overlay, f"SAFETY BOX: ACTIVE (±{max_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.56, s_color, 2)
+        cv2.putText(overlay, f"OFFSET: X:{rx:+d} Y:{ry:+d} Z:{rz:+d} cm", (safe_x + 12, safe_y + 56), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (220, 220, 220), 1)
+        cv2.putText(overlay, f"DISTANCE: {dist_cm}cm / {max_cm}cm [{b_status}]", (safe_x + 12, safe_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.50, s_color, 2)
+        cv2.putText(overlay, "Press [H] to Re-anchor | [K] to Clear", (safe_x + 12, safe_y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 160, 160), 1)
+        cv2.circle(overlay, (safe_x + safe_w - 20, safe_y + 26), 7, s_color, -1)
+    else:
+        cv2.putText(overlay, f"SAFETY BOX: UNSET (±{max_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 140, 255), 2)
+        cv2.putText(overlay, "Press [H] to Set Default Point", (safe_x + 12, safe_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2)
+        cv2.putText(overlay, f"Blocks movement > {max_cm}cm in any direction", (safe_x + 12, safe_y + 84), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 180, 180), 1)
+        cv2.putText(overlay, "[H] Anchor Default Point", (safe_x + 12, safe_y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1)
+        cv2.circle(overlay, (safe_x + safe_w - 20, safe_y + 26), 7, (0, 140, 255), -1)
+
     # Bottom Control Bar
     cv2.rectangle(overlay, (0, h - 45), (w, h), (20, 20, 20), -1)
-    controls_txt = "[M] Move Lock | [SPACE] E-Stop | [G] Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land | [+/-] Step | [Esc] Exit"
-    cv2.putText(overlay, controls_txt, (15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 200, 200), 1)
+    controls_txt = "[H] Anchor Pt | [M] Move Lock | [SPACE] E-Stop | [G] Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land | [+/-] Step"
+    cv2.putText(overlay, controls_txt, (15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
     # Last Action Banner
     if last_action:
-        cv2.putText(overlay, f"> {last_action}", (20, h - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1)
+        color = (0, 0, 255) if "BLOCKED" in last_action else (0, 255, 200)
+        cv2.putText(overlay, f"> {last_action}", (20, h - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
 
     alpha = 0.88
     return cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
@@ -256,6 +304,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Android Phone IP or Host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8080, help="REST API Port (default: 8080)")
     parser.add_argument("--step", type=float, default=0.10, help="Step distance in meters (default: 0.10 = 10cm)")
+    parser.add_argument("--boundary", type=float, default=0.50, help="Safety boundary radius in meters (default: 0.50 = 50cm)")
     parser.add_argument("--speed", type=float, default=0.3, help="Max speed in m/s (default: 0.3)")
     parser.add_argument("--model", default="gesture_recognizer.task", help="MediaPipe model task path")
     parser.add_argument("--min-score", type=float, default=0.65, help="Minimum gesture recognition confidence (default: 0.65)")
@@ -373,21 +422,52 @@ def main():
     command_interval = 0.70    # Rate limiter between step triggers (700ms)
     action_in_flight = False
 
-    def do_action(action_fn, desc, is_movement=True):
-        nonlocal last_action, action_in_flight
+    # Safety Boundary Box (default: 50cm in all directions)
+    default_point_set = False
+    max_boundary = round(args.boundary, 2)
+    rel_x = 0.0
+    rel_y = 0.0
+    rel_z = 0.0
+    home_alt = 0.0
+
+    def do_action(action_fn, desc, is_movement=True, delta=(0.0, 0.0, 0.0)):
+        nonlocal last_action, action_in_flight, rel_x, rel_y, rel_z
+        if action_in_flight:
+            return
+
+        # Check safety boundary box if set
+        if default_point_set and is_movement and delta != (0.0, 0.0, 0.0):
+            cand_x = round(rel_x + delta[0], 3)
+            cand_y = round(rel_y + delta[1], 3)
+            cand_z = round(rel_z + delta[2], 3)
+            cand_dist = np.sqrt(cand_x**2 + cand_y**2 + cand_z**2)
+            max_axis = max(abs(cand_x), abs(cand_y), abs(cand_z))
+
+            if cand_dist > max_boundary + 0.001 or max_axis > max_boundary + 0.001:
+                last_action = f"BLOCKED: 50cm safety limit! (Target: X:{cand_x*100:+.0f} Y:{cand_y*100:+.0f} Z:{cand_z*100:+.0f} cm)"
+                print(f"⚠️  {last_action}")
+                return
+
         if is_movement and not movement_enabled:
+            if default_point_set and delta != (0.0, 0.0, 0.0):
+                rel_x = round(rel_x + delta[0], 3)
+                rel_y = round(rel_y + delta[1], 3)
+                rel_z = round(rel_z + delta[2], 3)
             last_action = f"[DRY RUN SIMULATED] {desc}"
             print(f">> {last_action} (Movement locked - press 'M' to enable)")
             return
-        if action_in_flight:
-            return
+
         action_in_flight = True
         last_action = desc
         print(f">> {desc}...")
         def _task():
-            nonlocal last_action, action_in_flight
+            nonlocal last_action, action_in_flight, rel_x, rel_y, rel_z
             try:
                 action_fn()
+                if default_point_set and delta != (0.0, 0.0, 0.0):
+                    rel_x = round(rel_x + delta[0], 3)
+                    rel_y = round(rel_y + delta[1], 3)
+                    rel_z = round(rel_z + delta[2], 3)
                 last_action = f"{desc} -> Done"
             except Exception as e:
                 last_action = f"{desc} -> Error: {e}"
@@ -402,8 +482,12 @@ def main():
 
     print("\n" + "-" * 65)
     print("GESTURE & KEYBOARD CONTROLS:")
+    print("  [H]              Set Default Point (Anchors 50cm Safety Box)")
+    print("  [K]              Clear Default Point")
     print("  [👍 Thumb Up]    Climb (Move Up by step distance)")
     print("  [👎 Thumb Down]  Descend (Move Down by step distance)")
+    print("  [✋ Open Palm]   Move Backward (by step distance)")
+    print("  [✊ Closed Fist] Move Forward (by step distance)")
     print("  [M]              Toggle Drone Movement ON/OFF (Dry Run Mode)")
     print("  [SPACE]          E-Stop / Pause Gesture Control")
     print("  [G]              Toggle Gesture Tracking On/Off")
@@ -438,7 +522,7 @@ def main():
                         detected_label = top_gesture.category_name
                         detected_score = top_gesture.score
 
-                    if detected_score < args.min_score or detected_label not in ("Thumb_Up", "Thumb_Down"):
+                    if detected_score < args.min_score or detected_label not in ("Thumb_Up", "Thumb_Down", "Open_Palm", "Closed_Fist"):
                         detected_label = "None"
 
                     # Debounce gesture state
@@ -454,16 +538,30 @@ def main():
 
                     gesture_info["label"] = detected_label
                     gesture_info["score"] = detected_score
-                    gesture_info["action"] = "CLIMB" if active_gesture == "Thumb_Up" else "DESCEND" if active_gesture == "Thumb_Down" else "HOVER"
+                    action_map = {
+                        "Thumb_Up": "CLIMB",
+                        "Thumb_Down": "DESCEND",
+                        "Open_Palm": "BACKWARD",
+                        "Closed_Fist": "FORWARD"
+                    }
+                    gesture_info["action"] = action_map.get(active_gesture, "HOVER")
 
                     # Trigger drone movement if gesture is active and rate limit allows
                     if active_gesture == "Thumb_Up" and (now - last_command_time >= command_interval):
                         last_command_time = now
-                        do_action(lambda: client.moveUp(step_dist), f"Gesture: Move Up {int(step_dist*100)}cm")
+                        do_action(lambda: client.moveUp(step_dist), f"Gesture: Move Up {int(step_dist*100)}cm", delta=(0.0, 0.0, step_dist))
 
                     elif active_gesture == "Thumb_Down" and (now - last_command_time >= command_interval):
                         last_command_time = now
-                        do_action(lambda: client.moveDown(step_dist), f"Gesture: Move Down {int(step_dist*100)}cm")
+                        do_action(lambda: client.moveDown(step_dist), f"Gesture: Move Down {int(step_dist*100)}cm", delta=(0.0, 0.0, -step_dist))
+
+                    elif active_gesture == "Open_Palm" and (now - last_command_time >= command_interval):
+                        last_command_time = now
+                        do_action(lambda: client.moveBackward(step_dist), f"Gesture: Move Backward {int(step_dist*100)}cm", delta=(-step_dist, 0.0, 0.0))
+
+                    elif active_gesture == "Closed_Fist" and (now - last_command_time >= command_interval):
+                        last_command_time = now
+                        do_action(lambda: client.moveForward(step_dist), f"Gesture: Move Forward {int(step_dist*100)}cm", delta=(step_dist, 0.0, 0.0))
 
                 else:
                     gesture_info["label"] = "Paused"
@@ -471,7 +569,16 @@ def main():
                     gesture_info["action"] = "PAUSED"
 
             # Draw HUD
-            hud_frame = draw_hud(display_frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, last_action)
+            cur_dist = np.sqrt(rel_x**2 + rel_y**2 + rel_z**2) if default_point_set else 0.0
+            safety_info = {
+                "set": default_point_set,
+                "x": rel_x,
+                "y": rel_y,
+                "z": rel_z,
+                "dist": cur_dist,
+                "max": max_boundary
+            }
+            hud_frame = draw_hud(display_frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, safety_info, last_action)
             cv2.imshow(window_name, hud_frame)
 
             # Key check
@@ -480,6 +587,23 @@ def main():
             if key in (27, ord('x'), ord('X')):
                 print("Exit requested. Quitting...")
                 break
+
+            elif key in (ord('h'), ord('H')):
+                default_point_set = True
+                rel_x = 0.0
+                rel_y = 0.0
+                rel_z = 0.0
+                home_alt = telemetry.get("altitude", 0.0)
+                last_action = f"DEFAULT POINT SET! (50cm safety box active around Alt: {home_alt:.2f}m)"
+                print(f"\n>> {last_action}\n")
+
+            elif key in (ord('k'), ord('K')):
+                default_point_set = False
+                rel_x = 0.0
+                rel_y = 0.0
+                rel_z = 0.0
+                last_action = "DEFAULT POINT CLEARED (Safety box disabled)"
+                print(f"\n>> {last_action}\n")
 
             elif key in (ord('m'), ord('M')):
                 movement_enabled = not movement_enabled
@@ -497,37 +621,37 @@ def main():
                 print(f">> {last_action}")
 
             elif key in (ord('w'), ord('W')):
-                do_action(lambda: client.moveForward(step_dist), f"Manual Move Forward {int(step_dist*100)}cm")
+                do_action(lambda: client.moveForward(step_dist), f"Manual Move Forward {int(step_dist*100)}cm", delta=(step_dist, 0.0, 0.0))
 
             elif key in (ord('s'), ord('S')):
-                do_action(lambda: client.moveBackward(step_dist), f"Manual Move Backward {int(step_dist*100)}cm")
+                do_action(lambda: client.moveBackward(step_dist), f"Manual Move Backward {int(step_dist*100)}cm", delta=(-step_dist, 0.0, 0.0))
 
             elif key in (ord('a'), ord('A')):
-                do_action(lambda: client.moveLeft(step_dist), f"Manual Move Left {int(step_dist*100)}cm")
+                do_action(lambda: client.moveLeft(step_dist), f"Manual Move Left {int(step_dist*100)}cm", delta=(0.0, -step_dist, 0.0))
 
             elif key in (ord('d'), ord('D')):
-                do_action(lambda: client.moveRight(step_dist), f"Manual Move Right {int(step_dist*100)}cm")
+                do_action(lambda: client.moveRight(step_dist), f"Manual Move Right {int(step_dist*100)}cm", delta=(0.0, step_dist, 0.0))
 
             elif key in (ord('u'), ord('U')):
-                do_action(lambda: client.moveUp(step_dist), f"Manual Move Up {int(step_dist*100)}cm")
+                do_action(lambda: client.moveUp(step_dist), f"Manual Move Up {int(step_dist*100)}cm", delta=(0.0, 0.0, step_dist))
 
             elif key in (ord('j'), ord('J')):
-                do_action(lambda: client.moveDown(step_dist), f"Manual Move Down {int(step_dist*100)}cm")
+                do_action(lambda: client.moveDown(step_dist), f"Manual Move Down {int(step_dist*100)}cm", delta=(0.0, 0.0, -step_dist))
 
             elif key in (ord('q'), ord('Q')):
-                do_action(lambda: client.rotateCounterClockwise(step_angle), f"Manual Rotate CCW {step_angle}°")
+                do_action(lambda: client.rotateCounterClockwise(step_angle), f"Manual Rotate CCW {step_angle}°", delta=(0.0, 0.0, 0.0))
 
             elif key in (ord('e'), ord('E')):
-                do_action(lambda: client.rotateClockwise(step_angle), f"Manual Rotate CW {step_angle}°")
+                do_action(lambda: client.rotateClockwise(step_angle), f"Manual Rotate CW {step_angle}°", delta=(0.0, 0.0, 0.0))
 
             elif key in (ord('t'), ord('T')):
-                do_action(lambda: client.takeOff(), "Auto Takeoff")
+                do_action(lambda: client.takeOff(), "Auto Takeoff", is_movement=True, delta=(0.0, 0.0, 0.0))
 
             elif key in (ord('l'), ord('L')):
-                do_action(lambda: client.land(), "Auto Landing")
+                do_action(lambda: client.land(), "Auto Landing", is_movement=True, delta=(0.0, 0.0, 0.0))
 
             elif key in (ord('c'), ord('C')):
-                do_action(lambda: client.confirmLanding(), "Confirm Landing")
+                do_action(lambda: client.confirmLanding(), "Confirm Landing", is_movement=False)
 
             elif key in (ord('p'), ord('P')):
                 do_action(lambda: client.captureShot(), "Capture Photo", is_movement=False)

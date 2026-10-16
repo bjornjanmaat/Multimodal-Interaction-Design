@@ -4,6 +4,8 @@ A real-time hand gesture recognition flight system for DJI drones.
 Scans the live RTSP drone camera stream using **Google MediaPipe** to recognize gestures:
 - **`Thumb_Up` (👍)**: Commands the drone to climb **Up** by step distance (default: 10cm).
 - **`Thumb_Down` (👎)**: Commands the drone to descend **Down** by step distance (default: 10cm).
+- **`Open_Palm` (✋ Hand Open)**: Commands the drone to move **Backward** by step distance (default: 10cm).
+- **`Closed_Fist` (✊ Hand Closed)**: Commands the drone to move **Forward** by step distance (default: 10cm).
 - **`No Hand / Neutral`**: Drone hovers safely in place.
 - **`Spacebar`**: Emergency Stop (E-Stop) toggle to immediately pause/resume gesture control.
 

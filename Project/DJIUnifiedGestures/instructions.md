@@ -91,6 +91,8 @@ If your phone is plugged in via USB cable:
 |---|---|
 | **👍 Thumb Up** | **Climb / Move Up** (by step distance, default 10cm) |
 | **👎 Thumb Down** | **Descend / Move Down** (by step distance, default 10cm) |
+| **✋ Open Palm (Hand Open)** | **Move Backward** (by step distance, default 10cm) |
+| **✊ Closed Fist (Hand Closed)** | **Move Forward** (by step distance, default 10cm) |
 | **Neutral / No Hand** | **Hover in Place** |
 
 ---
@@ -99,6 +101,8 @@ If your phone is plugged in via USB cable:
 
 | Key | Action | Notes |
 |---|---|---|
+| **`H`** | **Set Default Point (50cm Safety Box)** | Sets current position as anchor; blocks any movement > 50cm in all directions |
+| **`K`** | **Clear Default Point** | Disables the 50cm safety boundary box |
 | **`M`** | **Toggle Drone Movement** | Switch between **Dry Run** (simulated) and **Live Flight** |
 | **`Space`** | **E-Stop / Pause Gestures** | Instantly freeze gesture commands |
 | **`G`** | **Toggle Gesture Tracking** | Switch between gesture control and manual keys only |
