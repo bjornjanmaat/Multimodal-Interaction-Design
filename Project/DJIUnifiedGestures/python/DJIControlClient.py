@@ -278,12 +278,12 @@ class MockDJIControlClient:
 
     def moveForward(self, distance: float) -> Dict[str, Any]:
         self.x = round(self.x + distance, 2)
-        print(f"[SIMULATOR] Virtual Drone: Move Forward +{int(distance*100)}cm -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
+        print(f"[SIMULATOR] Virtual Drone: Move Forward +{int(distance*100)}cm @ {self.max_speed:.2f} m/s -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
         return {"code": 0, "state": "SUCCESS"}
 
     def moveBackward(self, distance: float) -> Dict[str, Any]:
         self.x = round(self.x - distance, 2)
-        print(f"[SIMULATOR] Virtual Drone: Move Backward -{int(distance*100)}cm -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
+        print(f"[SIMULATOR] Virtual Drone: Move Backward -{int(distance*100)}cm @ {self.max_speed:.2f} m/s -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
         return {"code": 0, "state": "SUCCESS"}
 
     def moveLeft(self, distance: float) -> Dict[str, Any]:

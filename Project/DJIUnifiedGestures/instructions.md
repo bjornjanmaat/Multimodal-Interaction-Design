@@ -94,15 +94,21 @@ If your phone is plugged in via USB cable:
 
 ## Controls & Gestures
 
-### Hand Gestures (Detected via Drone Camera)
+### Hand Gestures (Detected via Drone Camera or Laptop Webcam)
 
-| Gesture | Action |
-|---|---|
-| **👍 Thumb Up** | **Climb / Move Up** (by step distance, default 10cm) |
-| **👎 Thumb Down** | **Descend / Move Down** (by step distance, default 10cm) |
-| **✋ Open Palm (Hand Open)** | **Move Backward** (by step distance, default 10cm) |
-| **✊ Closed Fist (Hand Closed)** | **Move Forward** (by step distance, default 10cm) |
-| **Neutral / No Hand** | **Hover in Place** |
+| Gesture | Action | Notes |
+|---|---|---|
+| **✋ $\rightarrow$ ✊ Closing Hand (Open to Closed)** | **Move Forward** | **Speed-responsive**: Fast snap = Fast flight (~0.75m/s), Slow squeeze = Slow crawl (~0.18m/s) |
+| **✊ $\rightarrow$ ✋ Opening Hand (Closed to Open)** | **Move Backward** | **Speed-responsive**: Fast snap = Fast flight (~0.75m/s), Slow open = Slow crawl (~0.18m/s) |
+| **👍 Thumb Up** | **Climb / Move Up** | Moves up by step distance (default 10cm) |
+| **👎 Thumb Down** | **Descend / Move Down** | Moves down by step distance (default 10cm) |
+| **Neutral / No Hand** | **Hover in Place** | Hand steady or out of frame |
+
+> [!TIP]
+> **Dynamic Hand Speed Control**:
+> - **Fast Snap ($\le 0.20\text{s}$)**: The drone accelerates quickly up to **$0.80\text{ m/s}$** (`[FAST]`).
+> - **Normal Pace ($\sim 0.35\text{s}$)**: The drone cruises at **$0.35 - 0.50\text{ m/s}$** (`[NORMAL]`).
+> - **Slow Gentle Move ($\ge 0.55\text{s}$)**: The drone creeps at a precision crawl of **$0.15 - 0.25\text{ m/s}$** (`[SLOW]`).
 
 ---
 

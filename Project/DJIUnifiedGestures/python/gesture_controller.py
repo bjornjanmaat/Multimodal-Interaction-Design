@@ -2,15 +2,15 @@
 """
 DJI Unified Gesture Controller & Live Stream HUD
 =================================================
-Recognizes hand gestures (Thumbs Up / Thumbs Down / Open Palm / Closed Fist) from the drone's live camera
-stream using Google MediaPipe to command drone 3D motion:
+Recognizes dynamic hand gesture transitions and postures using Google MediaPipe
+to command drone 3D motion:
 
 Controls:
-  - Thumbs Up (👍)    -> Drone climbs (Up) by step distance
-  - Thumbs Down (👎)  -> Drone descends (Down) by step distance
-  - Open Palm (✋)    -> Drone moves Backward by step distance
-  - Closed Fist (✊)  -> Drone moves Forward by step distance
-  - No Hand / Neutral -> Drone hovers in place
+  - Closing Hand (✋ -> ✊ Open to Closed) -> Drone moves Forward by step distance
+  - Opening Hand (✊ -> ✋ Closed to Open) -> Drone moves Backward by step distance
+  - Thumbs Up (👍)                         -> Drone climbs (Up) by step distance
+  - Thumbs Down (👎)                       -> Drone descends (Down) by step distance
+  - No Hand / Neutral                      -> Drone hovers in place
   - Spacebar          -> Emergency Stop / Toggle Gesture Control
   - T                 -> Auto Takeoff
   - L                 -> Auto Land
@@ -29,6 +29,7 @@ import sys
 import time
 import threading
 import argparse
+from collections import deque
 
 # Suppress noisy FFmpeg macroblock decode warnings and force TCP transport for robust RTSP
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
@@ -170,6 +171,37 @@ class VideoReceiver:
             self.cap.release()
 
 
+def compute_hand_openness(landmarks):
+    """Computes normalized fingertip extension ratio relative to palm size."""
+    if not landmarks or len(landmarks) < 21:
+        return 1.4
+    try:
+        w = np.array([landmarks[0].x, landmarks[0].y, landmarks[0].z])
+        m_mcp = np.array([landmarks[9].x, landmarks[9].y, landmarks[9].z])
+        palm_scale = np.linalg.norm(m_mcp - w)
+        if palm_scale < 1e-4:
+            return 1.4
+        tips = [8, 12, 16, 20]  # Index, Middle, Ring, Pinky tips
+        dists = [np.linalg.norm(np.array([landmarks[t].x, landmarks[t].y, landmarks[t].z]) - w) / palm_scale for t in tips]
+        return float(np.mean(dists))
+    except Exception:
+        return 1.4
+
+
+def map_duration_to_speed(duration, min_speed=0.15, max_speed=0.80, min_dur=0.12, max_dur=0.65):
+    """Maps gesture transition duration to drone flight speed in m/s."""
+    d_clamped = min(max(duration, min_dur), max_dur)
+    factor = (max_dur - d_clamped) / (max_dur - min_dur)  # 1.0 for fast (<=0.12s), 0.0 for slow (>=0.65s)
+    speed = round(min_speed + factor * (max_speed - min_speed), 2)
+    if factor >= 0.65:
+        tier = "FAST"
+    elif factor <= 0.30:
+        tier = "SLOW"
+    else:
+        tier = "NORMAL"
+    return speed, tier
+
+
 def init_mediapipe_recognizer(model_path):
     """Initializes MediaPipe GestureRecognizer."""
     if not os.path.exists(model_path):
@@ -219,13 +251,17 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
     # Telemetry: Altitude & Heading
     alt_txt = f"ALT: {telemetry['altitude']:.2f} m"
     hdg_txt = f"HDG: {telemetry['heading']:.1f}°"
-    cv2.putText(overlay, alt_txt, (cx - 150, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-    cv2.putText(overlay, hdg_txt, (cx + 30, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    cv2.putText(overlay, alt_txt, (cx - 190, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+    cv2.putText(overlay, hdg_txt, (cx - 30, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
 
-    # Step Distance Badge
+    # Speed & Step Badges
+    cur_spd = telemetry.get("speed", 0.35)
+    spd_txt = f"SPD: {cur_spd:.2f}m/s"
+    cv2.putText(overlay, spd_txt, (cx + 120, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 180), 2)
+
     step_cm = int(round(step_dist * 100))
-    step_txt = f"STEP: {step_cm}cm ({step_dist:.2f}m)"
-    cv2.putText(overlay, step_txt, (w - 240, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
+    step_txt = f"STEP: {step_cm}cm"
+    cv2.putText(overlay, step_txt, (w - 200, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 220, 255), 2)
 
     # Dry Run / Movement Disabled Warning Banner
     if not movement_enabled:
@@ -233,7 +269,7 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
         cv2.putText(overlay, "DRY RUN MODE: MOVEMENT LOCKED [Press M to Unlock]", (cx - 235, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 2)
 
     # --- Gesture Recognition HUD Card (Top Left) ---
-    card_x, card_y, card_w, card_h = 20, 65, 380, 110
+    card_x, card_y, card_w, card_h = 20, 65, 410, 110
     cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (25, 25, 30), -1)
     cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (80, 80, 80), 1)
 
@@ -264,16 +300,30 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
             g_color = (0, 140, 255)
             action_txt = f"ACTION: DESCENDING (-{step_cm}cm){sim_suffix}"
             action_color = (0, 140, 255)
-        elif label == "Open_Palm":
-            g_badge = f"✋ OPEN PALM ({score:.0%})"
+        elif label == "Closing_Hand":
+            spd_val = gesture_info.get("speed", 0.35)
+            spd_tier = gesture_info.get("speed_tier", "NORMAL")
+            g_badge = f"✊ CLOSING HAND [{spd_tier}]"
+            g_color = (0, 255, 180) if movement_enabled else (0, 220, 255)
+            action_txt = f"ACTION: FORWARD (+{step_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
+            action_color = (0, 255, 180) if movement_enabled else (0, 220, 255)
+        elif label == "Opening_Hand":
+            spd_val = gesture_info.get("speed", 0.35)
+            spd_tier = gesture_info.get("speed_tier", "NORMAL")
+            g_badge = f"✋ OPENING HAND [{spd_tier}]"
             g_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
-            action_txt = f"ACTION: BACKWARD (-{step_cm}cm){sim_suffix}"
+            action_txt = f"ACTION: BACKWARD (-{step_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
             action_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
+        elif label == "Open_Palm":
+            g_badge = f"✋ HAND OPEN ({score:.0%})"
+            g_color = (180, 220, 255)
+            action_txt = "READY: Close hand (fist) -> Forward"
+            action_color = (200, 200, 200)
         elif label == "Closed_Fist":
-            g_badge = f"✊ CLOSED FIST ({score:.0%})"
-            g_color = (255, 200, 0) if movement_enabled else (255, 230, 120)
-            action_txt = f"ACTION: FORWARD (+{step_cm}cm){sim_suffix}"
-            action_color = (255, 200, 0) if movement_enabled else (255, 230, 120)
+            g_badge = f"✊ HAND CLOSED ({score:.0%})"
+            g_color = (180, 255, 220)
+            action_txt = "READY: Open hand -> Backward"
+            action_color = (200, 200, 200)
         else:
             g_badge = f"HAND: {label} ({score:.0%})" if label != "None" else "HAND: None (Hovering)"
             g_color = (200, 200, 200)
@@ -364,7 +414,9 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="REST API Port (default: 8080)")
     parser.add_argument("--step", type=float, default=0.10, help="Step distance in meters (default: 0.10 = 10cm)")
     parser.add_argument("--boundary", type=float, default=0.50, help="Safety boundary radius in meters (default: 0.50 = 50cm)")
-    parser.add_argument("--speed", type=float, default=0.3, help="Max speed in m/s (default: 0.3)")
+    parser.add_argument("--speed", type=float, default=0.35, help="Base speed in m/s (default: 0.35)")
+    parser.add_argument("--min-speed", type=float, default=0.15, help="Minimum speed for slow gestures in m/s (default: 0.15)")
+    parser.add_argument("--max-speed", type=float, default=0.80, help="Maximum speed for fast gestures in m/s (default: 0.80)")
     parser.add_argument("--model", default="gesture_recognizer.task", help="MediaPipe model task path")
     parser.add_argument("--min-score", type=float, default=0.65, help="Minimum gesture recognition confidence (default: 0.65)")
     parser.add_argument("--hold-time", type=float, default=0.25, help="Debounce hold time in seconds (default: 0.25)")
@@ -474,7 +526,7 @@ def main():
         video.start()
 
     # Telemetry State
-    telemetry = {"connected": True, "altitude": 0.0, "heading": 0.0, "simulator": is_simulator}
+    telemetry = {"connected": True, "altitude": 0.0, "heading": 0.0, "simulator": is_simulator, "speed": args.speed}
     running = True
 
     def telemetry_loop():
@@ -497,6 +549,15 @@ def main():
     active_gesture = "None"
     gesture_info = {"label": "None", "score": 0.0, "action": "HOVER"}
     last_action = "System Ready"
+
+    # Hand Open/Close Transition Tracking
+    last_stable_posture = None      # "OPEN" or "CLOSED"
+    last_transition_event = None    # "OPEN_TO_CLOSED" or "CLOSED_TO_OPEN"
+    last_transition_time = 0.0
+    last_hand_seen_time = 0.0
+    last_transition_speed = args.speed
+    last_transition_tier = "NORMAL"
+    openness_history = deque(maxlen=40)
 
     estop = False              # Emergency Stop toggle
     gesture_enabled = True     # Gesture control enable toggle
@@ -572,13 +633,13 @@ def main():
         print(f"   Drone Host: {host}:{port} | Stream: {rtsp_url}")
     print("-" * 65)
     print("GESTURE & KEYBOARD CONTROLS:")
-    print("  [H]              Set Default Point (Anchors 50cm Safety Box)")
-    print("  [K]              Clear Default Point")
-    print("  [👍 Thumb Up]    Climb (Move Up by step distance)")
-    print("  [👎 Thumb Down]  Descend (Move Down by step distance)")
-    print("  [✋ Open Palm]   Move Backward (by step distance)")
-    print("  [✊ Closed Fist] Move Forward (by step distance)")
-    print("  [M]              Toggle Drone Movement ON/OFF (Dry Run Mode)")
+    print("  [H]                     Set Default Point (Anchors 50cm Safety Box)")
+    print("  [K]                     Clear Default Point")
+    print("  [👍 Thumb Up]           Climb (Move Up by step distance)")
+    print("  [👎 Thumb Down]         Descend (Move Down by step distance)")
+    print("  [✋ -> ✊ Closing Hand] Move Forward (Speed depends on closing speed)")
+    print("  [✊ -> ✋ Opening Hand] Move Backward (Speed depends on opening speed)")
+    print("  [M]                     Toggle Drone Movement ON/OFF (Dry Run Mode)")
     print("  [SPACE]          E-Stop / Pause Gesture Control")
     print("  [G]              Toggle Gesture Tracking On/Off")
     print("  [W / S / A / D]  Manual Pitch & Roll")
@@ -609,52 +670,156 @@ def main():
 
                     detected_label = "None"
                     detected_score = 0.0
+                    hand_landmarks = None
 
-                    if recognition_result.gestures:
+                    if recognition_result.gestures and len(recognition_result.gestures[0]) > 0:
                         top_gesture = recognition_result.gestures[0][0]
                         detected_label = top_gesture.category_name
                         detected_score = top_gesture.score
 
-                    if detected_score < args.min_score or detected_label not in ("Thumb_Up", "Thumb_Down", "Open_Palm", "Closed_Fist"):
-                        detected_label = "None"
+                    if recognition_result.hand_landmarks and len(recognition_result.hand_landmarks) > 0:
+                        hand_landmarks = recognition_result.hand_landmarks[0]
 
-                    # Debounce gesture state
                     now = time.time()
-                    if detected_label != candidate_label:
-                        candidate_label = detected_label
-                        candidate_since = now
+                    hand_detected = (hand_landmarks is not None) or (detected_score >= args.min_score and detected_label != "None")
 
-                    if now - candidate_since >= args.hold_time:
-                        active_gesture = candidate_label
-                    if detected_label == "None":
-                        active_gesture = "None"
+                    if not hand_detected:
+                        if now - last_hand_seen_time > 0.8:
+                            # Reset posture if hand was out of view so entering frame doesn't trigger false transition
+                            last_stable_posture = None
+                    else:
+                        last_hand_seen_time = now
 
-                    gesture_info["label"] = detected_label
-                    gesture_info["score"] = detected_score
-                    action_map = {
-                        "Thumb_Up": "CLIMB",
-                        "Thumb_Down": "DESCEND",
-                        "Open_Palm": "BACKWARD",
-                        "Closed_Fist": "FORWARD"
-                    }
-                    gesture_info["action"] = action_map.get(active_gesture, "HOVER")
+                    # Compute hand openness metric from landmarks
+                    openness = compute_hand_openness(hand_landmarks) if hand_landmarks else 1.4
+                    if hand_detected:
+                        openness_history.append((now, openness))
 
-                    # Trigger drone movement if gesture is active and rate limit allows
-                    if active_gesture == "Thumb_Up" and (now - last_command_time >= command_interval):
-                        last_command_time = now
-                        do_action(lambda: client.moveUp(step_dist), f"Gesture: Move Up {int(step_dist*100)}cm", delta=(0.0, 0.0, step_dist))
+                    # Determine instantaneous posture
+                    current_posture = "None"
+                    if detected_score >= args.min_score and detected_label in ("Thumb_Up", "Thumb_Down"):
+                        current_posture = detected_label
+                    elif hand_detected:
+                        # Open hand: classified as Open_Palm or finger extension high
+                        if (detected_score >= args.min_score and detected_label == "Open_Palm") or openness >= 1.60:
+                            current_posture = "OPEN"
+                        # Closed fist: classified as Closed_Fist or finger extension low
+                        elif (detected_score >= args.min_score and detected_label == "Closed_Fist") or openness <= 1.20:
+                            current_posture = "CLOSED"
+                        else:
+                            current_posture = "TRANSITION"
 
-                    elif active_gesture == "Thumb_Down" and (now - last_command_time >= command_interval):
-                        last_command_time = now
-                        do_action(lambda: client.moveDown(step_dist), f"Gesture: Move Down {int(step_dist*100)}cm", delta=(0.0, 0.0, -step_dist))
+                    # Handle transitions: Closing Hand -> Forward, Opening Hand -> Backward
+                    if current_posture == "CLOSED":
+                        if last_stable_posture == "OPEN":
+                            # User closed their hand! (Open -> Closed) -> MOVE FORWARD
+                            if now - last_command_time >= command_interval:
+                                last_command_time = now
+                                last_transition_event = "OPEN_TO_CLOSED"
+                                last_transition_time = now
 
-                    elif active_gesture == "Open_Palm" and (now - last_command_time >= command_interval):
-                        last_command_time = now
-                        do_action(lambda: client.moveBackward(step_dist), f"Gesture: Move Backward {int(step_dist*100)}cm", delta=(-step_dist, 0.0, 0.0))
+                                # Measure gesture closing duration from openness history
+                                start_time = now - 0.35
+                                for t_hist, op_hist in reversed(openness_history):
+                                    if op_hist >= 1.55:
+                                        start_time = t_hist
+                                        break
+                                duration = max(0.08, now - start_time)
+                                target_speed, speed_tier = map_duration_to_speed(duration, min_speed=args.min_speed, max_speed=args.max_speed)
+                                last_transition_speed = target_speed
+                                last_transition_tier = speed_tier
+                                telemetry["speed"] = target_speed
 
-                    elif active_gesture == "Closed_Fist" and (now - last_command_time >= command_interval):
-                        last_command_time = now
-                        do_action(lambda: client.moveForward(step_dist), f"Gesture: Move Forward {int(step_dist*100)}cm", delta=(step_dist, 0.0, 0.0))
+                                def _do_forward():
+                                    try:
+                                        client.setMaxSpeed(target_speed)
+                                    except Exception:
+                                        pass
+                                    return client.moveForward(step_dist)
+
+                                do_action(
+                                    _do_forward,
+                                    f"Gesture: Closing Hand [{speed_tier} {target_speed:.2f}m/s, {duration:.2f}s] -> Move Forward {int(step_dist*100)}cm",
+                                    delta=(step_dist, 0.0, 0.0)
+                                )
+                        last_stable_posture = "CLOSED"
+
+                    elif current_posture == "OPEN":
+                        if last_stable_posture == "CLOSED":
+                            # User opened their hand! (Closed -> Open) -> MOVE BACKWARD
+                            if now - last_command_time >= command_interval:
+                                last_command_time = now
+                                last_transition_event = "CLOSED_TO_OPEN"
+                                last_transition_time = now
+
+                                # Measure gesture opening duration from openness history
+                                start_time = now - 0.35
+                                for t_hist, op_hist in reversed(openness_history):
+                                    if op_hist <= 1.25:
+                                        start_time = t_hist
+                                        break
+                                duration = max(0.08, now - start_time)
+                                target_speed, speed_tier = map_duration_to_speed(duration, min_speed=args.min_speed, max_speed=args.max_speed)
+                                last_transition_speed = target_speed
+                                last_transition_tier = speed_tier
+                                telemetry["speed"] = target_speed
+
+                                def _do_backward():
+                                    try:
+                                        client.setMaxSpeed(target_speed)
+                                    except Exception:
+                                        pass
+                                    return client.moveBackward(step_dist)
+
+                                do_action(
+                                    _do_backward,
+                                    f"Gesture: Opening Hand [{speed_tier} {target_speed:.2f}m/s, {duration:.2f}s] -> Move Backward {int(step_dist*100)}cm",
+                                    delta=(-step_dist, 0.0, 0.0)
+                                )
+                        last_stable_posture = "OPEN"
+
+                    elif current_posture in ("Thumb_Up", "Thumb_Down"):
+                        last_stable_posture = None
+                        if current_posture == "Thumb_Up" and (now - last_command_time >= command_interval):
+                            last_command_time = now
+                            do_action(lambda: client.moveUp(step_dist), f"Gesture: Move Up {int(step_dist*100)}cm", delta=(0.0, 0.0, step_dist))
+                        elif current_posture == "Thumb_Down" and (now - last_command_time >= command_interval):
+                            last_command_time = now
+                            do_action(lambda: client.moveDown(step_dist), f"Gesture: Move Down {int(step_dist*100)}cm", delta=(0.0, 0.0, -step_dist))
+
+                    # Prepare gesture_info for HUD display
+                    if now - last_transition_time < 1.2 and last_transition_event == "OPEN_TO_CLOSED":
+                        gesture_info["label"] = "Closing_Hand"
+                        gesture_info["score"] = detected_score if detected_score > 0 else 0.95
+                        gesture_info["action"] = "FORWARD"
+                        gesture_info["speed"] = last_transition_speed
+                        gesture_info["speed_tier"] = last_transition_tier
+                    elif now - last_transition_time < 1.2 and last_transition_event == "CLOSED_TO_OPEN":
+                        gesture_info["label"] = "Opening_Hand"
+                        gesture_info["score"] = detected_score if detected_score > 0 else 0.95
+                        gesture_info["action"] = "BACKWARD"
+                        gesture_info["speed"] = last_transition_speed
+                        gesture_info["speed_tier"] = last_transition_tier
+                    elif current_posture == "Thumb_Up":
+                        gesture_info["label"] = "Thumb_Up"
+                        gesture_info["score"] = detected_score
+                        gesture_info["action"] = "CLIMB"
+                    elif current_posture == "Thumb_Down":
+                        gesture_info["label"] = "Thumb_Down"
+                        gesture_info["score"] = detected_score
+                        gesture_info["action"] = "DESCEND"
+                    elif current_posture == "OPEN":
+                        gesture_info["label"] = "Open_Palm"
+                        gesture_info["score"] = detected_score if detected_score > 0 else 0.90
+                        gesture_info["action"] = "HOVER"
+                    elif current_posture == "CLOSED":
+                        gesture_info["label"] = "Closed_Fist"
+                        gesture_info["score"] = detected_score if detected_score > 0 else 0.90
+                        gesture_info["action"] = "HOVER"
+                    else:
+                        gesture_info["label"] = "None"
+                        gesture_info["score"] = 0.0
+                        gesture_info["action"] = "HOVER"
 
                 else:
                     gesture_info["label"] = "Paused"
