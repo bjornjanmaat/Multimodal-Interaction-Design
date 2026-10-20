@@ -6,6 +6,9 @@ Scans the live RTSP drone camera stream using **Google MediaPipe** to recognize 
 - **`Opening Hand` (✊ $\rightarrow$ ✋ Closed to Open)**: Commands the drone to move **Backward** by step distance (default: 10cm).
 - **`Thumb_Up` (👍)**: Commands the drone to climb **Up** by step distance (default: 10cm).
 - **`Thumb_Down` (👎)**: Commands the drone to descend **Down** by step distance (default: 10cm).
+- **`Gaze-Averted Thumb Haptic Buzz` (⚡)**: When the user's gaze is averted from the camera (looking Left, Right, Up, or Down) and performs a thumb gesture (**Thumb Up**, **Thumb Down**, **Thumb Left**, or **Thumb Right**), it triggers the wireless vibration motor via UDP (`10.114.198.176:5005`) with visual haptic feedback on the HUD.
+- **`Gaze Tracking` (👀)**: Tracks head pose (yaw/pitch) and iris position in real time using MediaPipe Face Mesh to determine whether the operator is looking straight at the camera or looking away, displayed clearly in the HUD interface.
+- **`Two-Player Rock-Paper-Scissors Duel` (⚔️)**: When two people are detected in the frame, an interactive Rock-Paper-Scissors duel starts automatically. Both players shoot their move (✊ Rock = `Closed_Fist`, ✋ Paper = `Open_Palm`, ✌️ Scissors = `Victory`). The winner is crowned pilot and receives exclusive gesture flight control of the drone! Press `[R]` anytime to trigger a rematch.
 - **`No Hand / Neutral`**: Drone hovers safely in place.
 - **`Spacebar`**: Emergency Stop (E-Stop) toggle to immediately pause/resume gesture control.
 

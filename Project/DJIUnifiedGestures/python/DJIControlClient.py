@@ -150,10 +150,13 @@ class DJIControlClient:
         return self.makeReqAndReturnJSON(f'/moveDown/{distance}')
 
     def moveForward(self, distance: float) -> Dict[str, Any]:
-        return self.makeReqAndReturnJSON(f'/moveForward/{distance}')
+        # On the drone's VirtualStick BODY coordinate frame, pitch velocity/axes are reversed:
+        # Calling Android endpoint /moveBackward/ moves the physical drone Forward.
+        return self.makeReqAndReturnJSON(f'/moveBackward/{distance}')
 
     def moveBackward(self, distance: float) -> Dict[str, Any]:
-        return self.makeReqAndReturnJSON(f'/moveBackward/{distance}')
+        # Calling Android endpoint /moveForward/ moves the physical drone Backward.
+        return self.makeReqAndReturnJSON(f'/moveForward/{distance}')
 
     def moveLeft(self, distance: float) -> Dict[str, Any]:
         return self.makeReqAndReturnJSON(f'/moveLeft/{distance}')

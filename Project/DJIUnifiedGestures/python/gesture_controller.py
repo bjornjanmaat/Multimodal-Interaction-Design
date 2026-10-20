@@ -2,10 +2,13 @@
 """
 DJI Unified Gesture Controller & Live Stream HUD
 =================================================
-Recognizes dynamic hand gesture transitions and postures using Google MediaPipe
-to command drone 3D motion:
+Recognizes dynamic hand gesture transitions, postures, and real-time gaze tracking
+(looking straight at the camera vs looking away) using Google MediaPipe to command
+drone 3D motion:
 
-Controls:
+Features:
+  - Gaze Tracking: Identifies if the person is looking straight at the camera or looking away
+    with live head pose (yaw/pitch) and iris position tracking in the HUD interface.
   - Closing Hand (✋ -> ✊ Open to Closed) -> Drone moves Forward by step distance
   - Opening Hand (✊ -> ✋ Closed to Open) -> Drone moves Backward by step distance
   - Thumbs Up (👍)                         -> Drone climbs (Up) by step distance
@@ -27,6 +30,7 @@ Run with project virtualenv:
 import os
 import sys
 import time
+import socket
 import threading
 import argparse
 from collections import deque
@@ -42,6 +46,154 @@ import mediapipe as mp
 # Add current directory to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from DJIControlClient import DJIControlClient, ControlMode, MockDJIControlClient
+
+
+class ArduinoVibrationController:
+    """Manages wireless UDP haptic feedback communication to Arduino vibration motor."""
+    def __init__(self, ip="10.114.198.176", port=5005):
+        self.ip = ip
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.last_trigger_time = 0.0
+        self.active_buzz_thread = None
+
+    def set_vibration(self, level: int):
+        """Sets motor speed from 0 (off) to 255 (maximum)."""
+        level = max(0, min(255, level))
+        try:
+            self.sock.sendto(str(level).encode(), (self.ip, self.port))
+        except Exception as e:
+            pass
+
+    def trigger_buzz_async(self, duration=0.30, intensity=255, cooldown=0.80):
+        """Triggers a vibration pulse in a background thread without blocking the video loop."""
+        now = time.time()
+        if now - self.last_trigger_time < cooldown:
+            return False
+        self.last_trigger_time = now
+
+        def _buzz():
+            try:
+                self.set_vibration(intensity)
+                time.sleep(duration)
+                self.set_vibration(0)
+            except Exception:
+                pass
+
+        threading.Thread(target=_buzz, daemon=True).start()
+        return True
+
+    def close(self):
+        try:
+            self.set_vibration(0)
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def classify_thumb_direction(landmarks, detected_label="None"):
+    """
+    Identifies 4-way thumb orientation:
+      - THUMB_UP
+      - THUMB_DOWN
+      - THUMB_LEFT
+      - THUMB_RIGHT
+    Strictly checks that the other 4 fingers are tightly curled (fist)
+    and the thumb is prominently extended outwards.
+    Returns None if the hand is an open palm, closed fist, or transition.
+    """
+    if not landmarks or len(landmarks) < 21:
+        if detected_label == "Thumb_Up":
+            return "THUMB_UP"
+        elif detected_label == "Thumb_Down":
+            return "THUMB_DOWN"
+        return None
+
+    try:
+        w = np.array([landmarks[0].x, landmarks[0].y, landmarks[0].z])
+        m_mcp = np.array([landmarks[9].x, landmarks[9].y, landmarks[9].z])
+        palm_scale = np.linalg.norm(m_mcp - w)
+        if palm_scale < 1e-4:
+            return None
+
+        # 1. Check extension of the other 4 fingers (Index, Middle, Ring, Pinky)
+        # In a genuine thumb gesture, all 4 other fingers must be curled into the palm!
+        tips = [8, 12, 16, 20]
+        pips = [6, 10, 14, 18]
+        curled_count = 0
+        tip_dists_to_wrist = []
+
+        for tip_idx, pip_idx in zip(tips, pips):
+            tip = np.array([landmarks[tip_idx].x, landmarks[tip_idx].y, landmarks[tip_idx].z])
+            pip = np.array([landmarks[pip_idx].x, landmarks[pip_idx].y, landmarks[pip_idx].z])
+            d_tip = np.linalg.norm(tip - w)
+            d_pip = np.linalg.norm(pip - w)
+            tip_dists_to_wrist.append(d_tip / palm_scale)
+
+            # Tip is curled if it's closer or barely further than PIP to wrist
+            if d_tip <= d_pip * 1.05:
+                curled_count += 1
+
+        avg_finger_ext = float(np.mean(tip_dists_to_wrist))
+        # If fingers are extended (open hand), this CANNOT be a thumb gesture!
+        if curled_count < 3 or avg_finger_ext > 1.30:
+            return None
+
+        # 2. Check Thumb Extension & Isolation from Palm / Fist
+        thumb_tip = np.array([landmarks[4].x, landmarks[4].y, landmarks[4].z])
+        thumb_ip = np.array([landmarks[3].x, landmarks[3].y, landmarks[3].z])
+        thumb_mcp = np.array([landmarks[2].x, landmarks[2].y, landmarks[2].z])
+        thumb_cmc = np.array([landmarks[1].x, landmarks[1].y, landmarks[1].z])
+
+        # Straightness / full extension of the thumb itself
+        thumb_segment_sum = (
+            np.linalg.norm(thumb_tip - thumb_ip) +
+            np.linalg.norm(thumb_ip - thumb_mcp) +
+            np.linalg.norm(thumb_mcp - thumb_cmc)
+        )
+        thumb_direct_dist = np.linalg.norm(thumb_tip - thumb_cmc)
+        thumb_straightness = thumb_direct_dist / (thumb_segment_sum + 1e-6)
+
+        # Distances of thumb tip to index knuckle (5), middle knuckle (9), and wrist (0)
+        index_mcp = np.array([landmarks[5].x, landmarks[5].y, landmarks[5].z])
+        mid_mcp = np.array([landmarks[9].x, landmarks[9].y, landmarks[9].z])
+
+        d_tip_to_index = np.linalg.norm(thumb_tip - index_mcp) / palm_scale
+        d_tip_to_mid = np.linalg.norm(thumb_tip - mid_mcp) / palm_scale
+        thumb_reach = thumb_direct_dist / palm_scale
+
+        # In a closed fist:
+        # - The thumb is folded across the fingers or tucked against index knuckle (d_tip_to_index < 0.65)
+        # - Thumb straightness is low (< 0.85) because the thumb IP/MCP joints are bent
+        # - Thumb reach from CMC is short (< 0.75)
+        # In an actual thumb gesture:
+        # - Thumb is clearly extended straight outwards (straightness >= 0.86)
+        # - Thumb tip is far from both the index knuckle (>= 0.62) and middle knuckle (>= 0.65)
+        # - Thumb reach is significant (>= 0.72)
+        if thumb_straightness < 0.86 or thumb_reach < 0.72 or d_tip_to_index < 0.62 or d_tip_to_mid < 0.65:
+            return None
+
+        # 3. Vector and Angle of Thumb from CMC/MCP (2) to Tip (4)
+        dx = landmarks[4].x - landmarks[2].x
+        dy = landmarks[4].y - landmarks[2].y
+
+        # Angle: 0° is Right, 90° is UP, 180°/-180° is Left, -90° is DOWN
+        angle = np.degrees(np.arctan2(-dy, dx))
+
+        if 50 <= angle <= 130:
+            return "THUMB_UP"
+        elif -130 <= angle <= -50:
+            return "THUMB_DOWN"
+        elif -40 < angle < 40:
+            return "THUMB_RIGHT"
+        elif angle >= 140 or angle <= -140:
+            return "THUMB_LEFT"
+        else:
+            # Ambiguous diagonal angle - don't jump to conclusions
+            return None
+
+    except Exception:
+        return None
 
 
 class WebcamReceiver:
@@ -217,7 +369,7 @@ def init_mediapipe_recognizer(model_path):
     options = GestureRecognizerOptions(
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=RunningMode.IMAGE,
-        num_hands=2,
+        num_hands=4,
         min_hand_detection_confidence=0.5,
         min_hand_presence_confidence=0.5,
         min_tracking_confidence=0.5
@@ -225,7 +377,444 @@ def init_mediapipe_recognizer(model_path):
     return GestureRecognizer.create_from_options(options)
 
 
-def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, safety_info, last_action=""):
+class GazeTracker:
+    """
+    Real-time Gaze Tracker inspired by antoinelame/GazeTracking.
+    Combines eye isolation, adaptive threshold pupil detection, and MediaPipe Face Mesh.
+    Calculates horizontal and vertical pupil ratios and head alignment to determine
+    whether the user is looking straight at the camera or looking left/right/away.
+    """
+    LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
+    RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
+
+    def __init__(self):
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.smooth_h = 0.46
+        self.smooth_v = 0.45
+        self.smooth_head_offset = 0.0
+        self.initialized = False
+
+    def _isolate_eye(self, gray_frame, lm, indices, w, h):
+        """Isolate an eye to have a frame without other parts of the face (Antoine Lamé style)."""
+        region = np.array([[int(lm[idx].x * w), int(lm[idx].y * h)] for idx in indices], dtype=np.int32)
+        black_frame = np.zeros((h, w), np.uint8)
+        mask = np.full((h, w), 255, np.uint8)
+        cv2.fillPoly(mask, [region], (0, 0, 0))
+        eye = cv2.bitwise_not(black_frame, gray_frame.copy(), mask=mask)
+
+        margin = 4
+        min_x = max(0, np.min(region[:, 0]) - margin)
+        max_x = min(w, np.max(region[:, 0]) + margin)
+        min_y = max(0, np.min(region[:, 1]) - margin)
+        max_y = min(h, np.max(region[:, 1]) + margin)
+
+        eye_frame = eye[min_y:max_y, min_x:max_x]
+        return eye_frame, (min_x, min_y), region
+
+    def _detect_pupil_threshold(self, eye_frame, fallback_xy):
+        """Detects the iris and estimates pupil position using Antoine Lamé bilateral + erode + thresholding."""
+        if eye_frame.shape[0] < 6 or eye_frame.shape[1] < 6:
+            return fallback_xy
+
+        kernel = np.ones((3, 3), np.uint8)
+        bilat = cv2.bilateralFilter(eye_frame, 10, 15, 15)
+        eroded = cv2.erode(bilat, kernel, iterations=2)
+
+        average_iris_size = 0.46
+        best_th = 40
+        min_diff = 1.0
+        for th in range(20, 80, 5):
+            b_frame = cv2.threshold(eroded, th, 255, cv2.THRESH_BINARY)[1]
+            c = b_frame[2:-2, 2:-2]
+            if c.size > 0:
+                sz = (c.size - cv2.countNonZero(c)) / c.size
+                diff = abs(sz - average_iris_size)
+                if diff < min_diff:
+                    min_diff = diff
+                    best_th = th
+
+        iris_bin = cv2.threshold(eroded, best_th, 255, cv2.THRESH_BINARY)[1]
+        contours, _ = cv2.findContours(iris_bin, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)[-2:]
+        contours = sorted(contours, key=cv2.contourArea)
+        if len(contours) >= 2:
+            m = cv2.moments(contours[-2])
+            if m['m00'] > 0:
+                px = int(m['m10'] / m['m00'])
+                py = int(m['m01'] / m['m00'])
+                return px, py
+        return fallback_xy
+
+    def process(self, frame_bgr):
+        h, w, _ = frame_bgr.shape
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+
+        if not results.multi_face_landmarks:
+            return {
+                "face_detected": False,
+                "looking_at_camera": False,
+                "direction": "NO FACE DETECTED",
+                "horizontal_ratio": 0.50,
+                "vertical_ratio": 0.50,
+                "confidence": 0.0,
+                "iris_left": None,
+                "iris_right": None
+            }
+
+        lm = results.multi_face_landmarks[0].landmark
+
+        # MediaPipe sub-millimeter Iris Center Landmarks
+        # 468 is right-in-camera iris center, 473 is left-in-camera iris center
+        mp_pl = (int(lm[468].x * w), int(lm[468].y * h))
+        mp_pr = (int(lm[473].x * w), int(lm[473].y * h))
+
+        # Antoine Lamé eye isolation & pupil threshold refinement
+        eye_l, orig_l, reg_l = self._isolate_eye(gray, lm, self.LEFT_EYE_INDICES, w, h)
+        eye_r, orig_r, reg_r = self._isolate_eye(gray, lm, self.RIGHT_EYE_INDICES, w, h)
+
+        fb_l = (mp_pl[0] - orig_l[0], mp_pl[1] - orig_l[1])
+        fb_r = (mp_pr[0] - orig_r[0], mp_pr[1] - orig_r[1])
+
+        pl_local = self._detect_pupil_threshold(eye_l, fb_l)
+        pr_local = self._detect_pupil_threshold(eye_r, fb_r)
+
+        final_pl = (orig_l[0] + pl_local[0], orig_l[1] + pl_local[1])
+        final_pr = (orig_r[0] + pr_local[0], orig_r[1] + pr_local[1])
+
+        # Eye socket boundary landmarks
+        # Left eye in frame: 33 (outer corner) to 133 (inner corner)
+        # Right eye in frame: 362 (inner corner) to 263 (outer corner)
+        p33_x = lm[33].x * w
+        p133_x = lm[133].x * w
+        p362_x = lm[362].x * w
+        p263_x = lm[263].x * w
+
+        # Relative horizontal ratios (0.0 = looking one side, 1.0 = looking other side)
+        r1 = (final_pl[0] - p33_x) / (p133_x - p33_x + 1e-6)
+        r2 = (final_pr[0] - p362_x) / (p263_x - p362_x + 1e-6)
+        raw_h = float((r1 + r2) / 2.0)
+
+        # Vertical ratios (top lid to bottom lid)
+        p159_y = lm[159].y * h
+        p145_y = lm[145].y * h
+        p386_y = lm[386].y * h
+        p374_y = lm[374].y * h
+
+        v1 = (final_pl[1] - p159_y) / (p145_y - p159_y + 1e-6)
+        v2 = (final_pr[1] - p386_y) / (p374_y - p386_y + 1e-6)
+        raw_v = float((v1 + v2) / 2.0)
+
+        # Head alignment offset (nose relative to midpoint between eyes)
+        mid_eyes_x = (p33_x + p263_x) / 2.0
+        eye_span = abs(p263_x - p33_x) + 1e-6
+        nose_x = lm[1].x * w
+        raw_head_offset = (nose_x - mid_eyes_x) / eye_span
+
+        # Exponential moving average filter
+        alpha = 0.35
+        if not self.initialized:
+            self.smooth_h = raw_h
+            self.smooth_v = raw_v
+            self.smooth_head_offset = raw_head_offset
+            self.initialized = True
+        else:
+            self.smooth_h = (1 - alpha) * self.smooth_h + alpha * raw_h
+            self.smooth_v = (1 - alpha) * self.smooth_v + alpha * raw_v
+            self.smooth_head_offset = (1 - alpha) * self.smooth_head_offset + alpha * raw_head_offset
+
+        # Antoine Lamé Gaze Direction Classification:
+        # Looking Center (Straight at Camera):
+        # 1. Pupil horizontal ratio centered (between 0.32 and 0.62)
+        # 2. Pupil vertical ratio centered (between 0.24 and 0.68)
+        # 3. Head facing forward (offset within ±0.17)
+        is_center_h = 0.32 <= self.smooth_h <= 0.62
+        is_center_v = 0.24 <= self.smooth_v <= 0.68
+        is_head_front = abs(self.smooth_head_offset) <= 0.17
+
+        looking_straight = bool(is_center_h and is_center_v and is_head_front)
+
+        # High threshold for VERY CLEAR gaze aversion:
+        # User must distinctly look away (significant pupil excursion or distinct head turn)
+        is_clear_head_turn = abs(self.smooth_head_offset) >= 0.22
+        is_clear_look_right = self.smooth_h >= 0.66
+        is_clear_look_left = self.smooth_h <= 0.28
+        is_clear_look_up = self.smooth_v <= 0.20
+        is_clear_look_down = self.smooth_v >= 0.72
+
+        clear_averted = bool(
+            is_clear_head_turn or
+            is_clear_look_right or
+            is_clear_look_left or
+            is_clear_look_up or
+            is_clear_look_down
+        )
+
+        # Determine gaze direction label (Antoine Lamé style: Center / Left / Right / Up / Down)
+        if looking_straight:
+            direction = "CENTER (LOOKING AT CAMERA)"
+        elif abs(self.smooth_head_offset) > 0.17:
+            direction = "LOOKING AWAY (HEAD TURNED)"
+        elif self.smooth_h > 0.62:
+            direction = "LOOKING RIGHT"
+        elif self.smooth_h < 0.32:
+            direction = "LOOKING LEFT"
+        elif self.smooth_v < 0.24:
+            direction = "LOOKING UP"
+        else:
+            direction = "LOOKING DOWN"
+
+        # Continuous confidence metric
+        h_dev = abs(self.smooth_h - 0.46) / 0.18
+        v_dev = abs(self.smooth_v - 0.44) / 0.22
+        head_dev = abs(self.smooth_head_offset) / 0.17
+        confidence = float(np.clip(1.0 - 0.5 * h_dev - 0.25 * v_dev - 0.25 * head_dev, 0.0, 1.0))
+
+        return {
+            "face_detected": True,
+            "looking_at_camera": looking_straight,
+            "clear_averted": clear_averted,
+            "direction": direction,
+            "horizontal_ratio": self.smooth_h,
+            "vertical_ratio": self.smooth_v,
+            "head_offset": self.smooth_head_offset,
+            "confidence": confidence,
+            "iris_left": final_pl,
+            "iris_right": final_pr
+        }
+
+
+class RockPaperScissorsGame:
+    """
+    Two-Player Rock-Paper-Scissors Referee for Drone Control.
+    When two people (faces) are detected in frame:
+      - Initiates an interactive duel countdown (3... 2... 1... SHOOT!).
+      - Reads each player's gesture:
+          * Rock: Closed_Fist (✊)
+          * Paper: Open_Palm (✋)
+          * Scissors: Victory (✌️)
+      - Resolves the winner (Player 1 vs Player 2).
+      - Hands over drone gesture flight control exclusively to the winner!
+      - If tie, initiates an instant rematch.
+      - If one person later leaves or returns, maintains or re-arbitrates ownership.
+    """
+    GESTURE_MAP = {
+        "Closed_Fist": "ROCK",
+        "Open_Palm": "PAPER",
+        "Victory": "SCISSORS"
+    }
+
+    EMOJI_MAP = {
+        "ROCK": "✊ ROCK",
+        "PAPER": "✋ PAPER",
+        "SCISSORS": "✌️ SCISSORS",
+        "NONE": "⏳ WAITING"
+    }
+
+    def __init__(self):
+        self.mp_face_detection = mp.solutions.face_detection
+        self.face_detector = self.mp_face_detection.FaceDetection(min_detection_confidence=0.5, model_selection=0)
+
+        # Game state: "IDLE", "COUNTDOWN", "RESOLVING", "WINNER"
+        self.state = "IDLE"
+        self.active_controller = "SINGLE"  # "P1", "P2", or "SINGLE"
+        self.winner = None                 # "P1", "P2", or None
+        self.winner_announce_time = 0.0
+
+        # Countdown management
+        self.countdown_start = 0.0
+        self.countdown_duration = 3.5      # 3.5 seconds countdown
+        self.last_two_face_time = 0.0
+        self.face_count = 0
+        self.face_boxes = []              # [(x1, y1, x2, y2, player_id)]
+
+        # Moves
+        self.p1_move = "NONE"
+        self.p2_move = "NONE"
+        self.p1_box = None
+        self.p2_box = None
+        self.duel_result_text = ""
+
+    def process(self, frame_bgr, hands_data):
+        """
+        Process frame for faces and hand gestures.
+        hands_data: list of dicts: [{'label': str, 'score': float, 'cx': float, 'cy': float, 'landmarks': ...}]
+        """
+        h, w, _ = frame_bgr.shape
+        now = time.time()
+
+        # 1. Detect faces
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        detection_result = self.face_detector.process(rgb)
+
+        detected_faces = []
+        if detection_result.detections:
+            for d in detection_result.detections:
+                bb = d.location_data.relative_bounding_box
+                x1 = int(max(0, bb.xmin * w))
+                y1 = int(max(0, bb.ymin * h))
+                box_w = int(bb.width * w)
+                box_h = int(bb.height * h)
+                x2 = min(w, x1 + box_w)
+                y2 = min(h, y1 + box_h)
+                cx = (x1 + x2) / 2.0
+                detected_faces.append({"box": (x1, y1, x2, y2), "cx": cx})
+
+        # Sort detected faces left to right across camera view
+        detected_faces = sorted(detected_faces, key=lambda f: f["cx"])
+        self.face_count = len(detected_faces)
+
+        # Single person or 0 persons:
+        if self.face_count < 2:
+            if now - self.winner_announce_time > 4.0:
+                self.state = "IDLE"
+                self.active_controller = "SINGLE"
+                self.winner = None
+            return {
+                "active": False,
+                "face_count": self.face_count,
+                "state": self.state,
+                "winner": self.winner,
+                "active_controller": self.active_controller,
+                "p1_move": "NONE",
+                "p2_move": "NONE",
+                "p1_box": None,
+                "p2_box": None,
+                "message": ""
+            }
+
+        # Exactly 2 (or more) faces detected:
+        p1_face = detected_faces[0]
+        p2_face = detected_faces[1]
+        self.p1_box = p1_face["box"]
+        self.p2_box = p2_face["box"]
+
+        # Map detected hands to Player 1 (left side of frame) or Player 2 (right side of frame)
+        mid_x = (p1_face["cx"] + p2_face["cx"]) / 2.0
+        p1_detected_move = "NONE"
+        p2_detected_move = "NONE"
+
+        for hand in hands_data:
+            lbl = hand.get("label", "None")
+            rps_gesture = self.GESTURE_MAP.get(lbl, None)
+            if rps_gesture:
+                if hand["cx"] < mid_x:
+                    p1_detected_move = rps_gesture
+                else:
+                    p2_detected_move = rps_gesture
+
+        # State Machine
+        if self.state == "IDLE":
+            # Initiate countdown when 2 people are in frame
+            self.state = "COUNTDOWN"
+            self.countdown_start = now
+            self.winner = None
+            self.duel_result_text = "2 PLAYERS DETECTED! ROCK PAPER SCISSORS FOR DRONE CONTROL!"
+            print(f"\n🎮 [RPS DUEL] 2 People in frame! Starting Rock-Paper-Scissors duel in 3s...")
+
+        elif self.state == "COUNTDOWN":
+            elapsed = now - self.countdown_start
+            remaining = self.countdown_duration - elapsed
+            if remaining <= 0.0:
+                # Time to resolve shoot!
+                self.state = "RESOLVING"
+                self.p1_move = p1_detected_move
+                self.p2_move = p2_detected_move
+                self._resolve_winner(now)
+
+        elif self.state == "RESOLVING":
+            # In resolving state, show winner for 5 seconds
+            if now - self.winner_announce_time > 5.0:
+                self.state = "WINNER"
+
+        elif self.state == "WINNER":
+            # Winner has drone control!
+            # If user presses R or if new challenge requested, can reset
+            pass
+
+        return {
+            "active": True,
+            "face_count": self.face_count,
+            "state": self.state,
+            "countdown_remaining": max(0.0, self.countdown_duration - (now - self.countdown_start)) if self.state == "COUNTDOWN" else 0.0,
+            "winner": self.winner,
+            "active_controller": self.active_controller,
+            "p1_move": p1_detected_move if self.state == "COUNTDOWN" else self.p1_move,
+            "p2_move": p2_detected_move if self.state == "COUNTDOWN" else self.p2_move,
+            "p1_box": self.p1_box,
+            "p2_box": self.p2_box,
+            "message": self.duel_result_text
+        }
+
+    def _resolve_winner(self, now):
+        """Resolves Rock-Paper-Scissors rules: Rock beats Scissors, Scissors beats Paper, Paper beats Rock."""
+        m1 = self.p1_move
+        m2 = self.p2_move
+
+        if m1 == "NONE" and m2 == "NONE":
+            self.duel_result_text = "NO MOVES DETECTED! REMATCH IN 2 SECONDS..."
+            print(f"⚠️ [RPS DUEL] No moves detected. Re-triggering...")
+            self.countdown_start = now - 1.5  # Quick rematch
+            self.state = "COUNTDOWN"
+            return
+
+        if m1 == "NONE":
+            self.winner = "P2"
+            self.active_controller = "P2"
+            self.duel_result_text = f"PLAYER 2 WINS BY DEFAULT ({self.EMOJI_MAP[m2]})! CONTROL GRANTED TO PLAYER 2!"
+            self.winner_announce_time = now
+            print(f"🏆 [RPS DUEL] Player 2 won by default with {m2}! Player 2 now has drone control.")
+            return
+
+        if m2 == "NONE":
+            self.winner = "P1"
+            self.active_controller = "P1"
+            self.duel_result_text = f"PLAYER 1 WINS BY DEFAULT ({self.EMOJI_MAP[m1]})! CONTROL GRANTED TO PLAYER 1!"
+            self.winner_announce_time = now
+            print(f"🏆 [RPS DUEL] Player 1 won by default with {m1}! Player 1 now has drone control.")
+            return
+
+        if m1 == m2:
+            self.duel_result_text = f"TIE GAME ({self.EMOJI_MAP[m1]} vs {self.EMOJI_MAP[m2]})! REMATCH IN 2 SECONDS..."
+            print(f"🤝 [RPS DUEL] Tie ({m1} vs {m2})! Rematch starting...")
+            self.countdown_start = now - 1.5  # Quick rematch
+            self.state = "COUNTDOWN"
+            return
+
+        # Rock beats Scissors (✌️), Scissors beats Paper (✋), Paper beats Rock (✊)
+        p1_wins = (
+            (m1 == "ROCK" and m2 == "SCISSORS") or
+            (m1 == "PAPER" and m2 == "ROCK") or
+            (m1 == "SCISSORS" and m2 == "PAPER")
+        )
+
+        if p1_wins:
+            self.winner = "P1"
+            self.active_controller = "P1"
+            self.duel_result_text = f"PLAYER 1 WINS ({self.EMOJI_MAP[m1]} beats {self.EMOJI_MAP[m2]})! CONTROL GRANTED TO PLAYER 1!"
+            print(f"🏆 [RPS DUEL] PLAYER 1 WINS ({m1} beats {m2})! Player 1 now has drone control.")
+        else:
+            self.winner = "P2"
+            self.active_controller = "P2"
+            self.duel_result_text = f"PLAYER 2 WINS ({self.EMOJI_MAP[m2]} beats {self.EMOJI_MAP[m1]})! CONTROL GRANTED TO PLAYER 2!"
+            print(f"🏆 [RPS DUEL] PLAYER 2 WINS ({m2} beats {m1})! Player 2 now has drone control.")
+
+        self.winner_announce_time = now
+
+    def reset_duel(self):
+        """Forces a new Rock-Paper-Scissors duel between players."""
+        self.state = "IDLE"
+        self.winner = None
+        self.active_controller = "SINGLE"
+
+
+def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, safety_info, gaze_info=None, rps_info=None, last_action="", haptic_active=False):
     """Draws rich aviation HUD with gesture indicators directly onto video frame."""
     h, w, _ = frame.shape
     overlay = frame.copy()
@@ -289,6 +878,11 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
         g_color = (150, 150, 150)
         action_txt = "ACTION: MANUAL KEYS ONLY [Press G]"
         action_color = (180, 180, 180)
+    elif label == "RPS_Match":
+        g_badge = "⚔️ RPS DUEL IN PROGRESS"
+        g_color = (0, 220, 255)
+        action_txt = "FLIGHT GESTURES: LOCKED FOR DUEL"
+        action_color = (0, 220, 255)
     else:
         if label == "Thumb_Up":
             g_badge = f"👍 THUMB UP ({score:.0%})"
@@ -372,9 +966,129 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
         cv2.putText(overlay, "[H] Anchor Default Point", (safe_x + 12, safe_y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1)
         cv2.circle(overlay, (safe_x + safe_w - 20, safe_y + 26), 7, (0, 140, 255), -1)
 
+    # --- Gaze Tracking HUD Card (Below Gesture Card) ---
+    if gaze_info is not None:
+        gaze_x, gaze_y, gaze_w, gaze_h = card_x, card_y + card_h + 10, card_w, 82
+        cv2.rectangle(overlay, (gaze_x, gaze_y), (gaze_x + gaze_w, gaze_y + gaze_h), (25, 25, 30), -1)
+        cv2.rectangle(overlay, (gaze_x, gaze_y), (gaze_x + gaze_w, gaze_y + gaze_h), (80, 80, 80), 1)
+
+        face_found = gaze_info.get("face_detected", False)
+        is_looking = gaze_info.get("looking_at_camera", False)
+        direction = gaze_info.get("direction", "NO FACE")
+        conf = gaze_info.get("confidence", 0.0)
+        h_ratio = gaze_info.get("horizontal_ratio", 0.50)
+        v_ratio = gaze_info.get("vertical_ratio", 0.50)
+
+        if not face_found:
+            gz_title = "👀 GAZE: NO FACE DETECTED"
+            gz_color = (130, 130, 130)
+            gz_sub = "Status: Position face toward camera"
+            gz_sub_col = (160, 160, 160)
+        elif is_looking:
+            gz_title = "👀 GAZE: LOOKING AT CAMERA"
+            gz_color = (0, 255, 120)
+            gz_sub = f"Status: {direction} (H:{h_ratio:.2f}, V:{v_ratio:.2f}, {conf:.0%})"
+            gz_sub_col = (0, 255, 180)
+        else:
+            gz_title = f"👀 GAZE: {direction}"
+            gz_color = (0, 140, 255)
+            gz_sub = f"Status: AVERTED (H:{h_ratio:.2f}, V:{v_ratio:.2f}, {conf:.0%})"
+            gz_sub_col = (0, 180, 255)
+
+        cv2.putText(overlay, gz_title, (gaze_x + 12, gaze_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.60, gz_color, 2)
+        cv2.putText(overlay, gz_sub, (gaze_x + 12, gaze_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, gz_sub_col, 1)
+        cv2.circle(overlay, (gaze_x + gaze_w - 24, gaze_y + 26), 8, gz_color, -1)
+
+        # Draw subtle eye iris tracking reticles directly on eyes if detected
+        iris_l = gaze_info.get("iris_left")
+        iris_r = gaze_info.get("iris_right")
+        reticle_color = (0, 255, 120) if is_looking else (0, 165, 255)
+        if iris_l and iris_l[0] > 0 and iris_l[1] > 0:
+            cv2.circle(overlay, iris_l, 4, reticle_color, -1)
+            cv2.circle(overlay, iris_l, 8, reticle_color, 1)
+        if iris_r and iris_r[0] > 0 and iris_r[1] > 0:
+            cv2.circle(overlay, iris_r, 4, reticle_color, -1)
+            cv2.circle(overlay, iris_r, 8, reticle_color, 1)
+
+    # --- Haptic Vibration Alert Indicator ---
+    if haptic_active:
+        hap_w, hap_h = 360, 48
+        hap_x = w - hap_w - 20
+        hap_y = 185
+        cv2.rectangle(overlay, (hap_x, hap_y), (hap_x + hap_w, hap_y + hap_h), (0, 0, 180), -1)
+        cv2.rectangle(overlay, (hap_x, hap_y), (hap_x + hap_w, hap_y + hap_h), (0, 255, 255), 2)
+        cv2.putText(overlay, "⚡ HAPTIC MOTOR BUZZ ACTIVE", (hap_x + 14, hap_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
+
+    # --- Rock-Paper-Scissors 2-Player Duel Overlay ---
+    if rps_info and rps_info.get("active", False):
+        state = rps_info.get("state", "IDLE")
+        p1_box = rps_info.get("p1_box")
+        p2_box = rps_info.get("p2_box")
+        p1_move = rps_info.get("p1_move", "NONE")
+        p2_move = rps_info.get("p2_move", "NONE")
+        winner = rps_info.get("winner")
+        active_ctrl = rps_info.get("active_controller")
+        msg = rps_info.get("message", "")
+
+        # Draw Player 1 Face Box (Left)
+        if p1_box:
+            bx1, by1, bx2, by2 = p1_box
+            is_p1_winner = (active_ctrl == "P1")
+            b_col = (0, 255, 120) if is_p1_winner else (0, 200, 255)
+            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), b_col, 3 if is_p1_winner else 2)
+
+            tag_txt = "PLAYER 1 (PILOT IN CONTROL 🎮)" if is_p1_winner else "PLAYER 1"
+            cv2.rectangle(overlay, (bx1, max(0, by1 - 30)), (bx1 + 280, by1), (20, 20, 20), -1)
+            cv2.putText(overlay, tag_txt, (bx1 + 6, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.48, b_col, 2)
+
+            # Move badge under face
+            mv_txt = f"Move: {RockPaperScissorsGame.EMOJI_MAP.get(p1_move, p1_move)}"
+            cv2.rectangle(overlay, (bx1, by2), (bx1 + 220, by2 + 30), (20, 20, 20), -1)
+            cv2.putText(overlay, mv_txt, (bx1 + 6, by2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+
+        # Draw Player 2 Face Box (Right)
+        if p2_box:
+            bx1, by1, bx2, by2 = p2_box
+            is_p2_winner = (active_ctrl == "P2")
+            b_col = (0, 255, 120) if is_p2_winner else (255, 150, 0)
+            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), b_col, 3 if is_p2_winner else 2)
+
+            tag_txt = "PLAYER 2 (PILOT IN CONTROL 🎮)" if is_p2_winner else "PLAYER 2"
+            cv2.rectangle(overlay, (bx1, max(0, by1 - 30)), (bx1 + 280, by1), (20, 20, 20), -1)
+            cv2.putText(overlay, tag_txt, (bx1 + 6, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.48, b_col, 2)
+
+            # Move badge under face
+            mv_txt = f"Move: {RockPaperScissorsGame.EMOJI_MAP.get(p2_move, p2_move)}"
+            cv2.rectangle(overlay, (bx1, by2), (bx1 + 220, by2 + 30), (20, 20, 20), -1)
+            cv2.putText(overlay, mv_txt, (bx1 + 6, by2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+
+        # Center Arena Banner
+        banner_w, banner_h = 680, 85
+        banner_x = cx - banner_w // 2
+        banner_y = 120
+        cv2.rectangle(overlay, (banner_x, banner_y), (banner_x + banner_w, banner_y + banner_h), (15, 15, 20), -1)
+        cv2.rectangle(overlay, (banner_x, banner_y), (banner_x + banner_w, banner_y + banner_h), (0, 220, 255), 2)
+
+        if state == "COUNTDOWN":
+            rem = rps_info.get("countdown_remaining", 0.0)
+            if rem > 2.0:
+                step_txt = "ROCK... (✊)"
+            elif rem > 1.0:
+                step_txt = "PAPER... (✋)"
+            else:
+                step_txt = "SCISSORS... SHOOT! (✌️)"
+            cv2.putText(overlay, "⚔️  ROCK-PAPER-SCISSORS FOR DRONE CONTROL", (banner_x + 30, banner_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 220, 255), 2)
+            cv2.putText(overlay, f"{step_txt}  [{rem:.1f}s]", (banner_x + 130, banner_y + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 3)
+
+        elif state in ("RESOLVING", "WINNER"):
+            win_txt = "👑 " + msg if msg else f"WINNER: {winner} HAS DRONE CONTROL!"
+            w_col = (0, 255, 120) if "PLAYER 1" in win_txt or "PLAYER 2" in win_txt else (0, 200, 255)
+            cv2.putText(overlay, "🎮 DRONE CONTROL DUEL RESULT:", (banner_x + 30, banner_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (200, 200, 200), 2)
+            cv2.putText(overlay, win_txt, (banner_x + 20, banner_y + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.60, w_col, 2)
+
     # Bottom Control Bar
     cv2.rectangle(overlay, (0, h - 45), (w, h), (20, 20, 20), -1)
-    controls_txt = "[H] Anchor Pt | [M] Move Lock | [SPACE] E-Stop | [G] Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land | [+/-] Step"
+    controls_txt = "[R] RPS Rematch | [H] Anchor Pt | [M] Move Lock | [SPACE] E-Stop | [G] Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land"
     cv2.putText(overlay, controls_txt, (15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
     # Last Action Banner
@@ -426,6 +1140,8 @@ def main():
     parser.add_argument("--webcam", action="store_true", help="Alias for --sim")
     parser.add_argument("--camera", type=int, default=0, help="Laptop webcam device index (default: 0)")
     parser.add_argument("--no-mirror", action="store_true", help="Disable horizontal flip (mirroring) on webcam")
+    parser.add_argument("--arduino-ip", default="10.114.198.176", help="Arduino vibration motor IP (default: 10.114.198.176)")
+    parser.add_argument("--arduino-port", type=int, default=5005, help="Arduino vibration motor UDP port (default: 5005)")
     args = parser.parse_args()
 
     is_simulator = args.sim or args.webcam
@@ -488,6 +1204,21 @@ def main():
         model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gesture_recognizer.task")
     recognizer = init_mediapipe_recognizer(model_path)
     print("MediaPipe Gesture Recognizer loaded successfully!")
+
+    # Initialize Gaze Tracker
+    print("Initializing MediaPipe Gaze & Face Mesh Tracker...")
+    gaze_tracker = GazeTracker()
+    print("Gaze Tracker loaded successfully!")
+
+    # Initialize Two-Player Rock-Paper-Scissors Referee
+    print("Initializing Two-Player Rock-Paper-Scissors Referee...")
+    rps_game = RockPaperScissorsGame()
+    print("RPS Referee loaded successfully!")
+
+    # Initialize Wireless Arduino Vibration Controller
+    print(f"Initializing Wireless Vibration Motor Controller ({args.arduino_ip}:{args.arduino_port})...")
+    vibration_controller = ArduinoVibrationController(ip=args.arduino_ip, port=args.arduino_port)
+    print("Wireless Vibration Controller ready!")
 
     # Determine video source
     if is_simulator:
@@ -563,6 +1294,9 @@ def main():
     gesture_enabled = True     # Gesture control enable toggle
     movement_enabled = not args.dry_run  # Physical drone movement toggle
     last_command_time = 0.0
+    last_haptic_buzz_time = 0.0
+    candidate_thumb_dir = None
+    candidate_thumb_since = 0.0
     command_interval = 0.70    # Rate limiter between step triggers (700ms)
     action_in_flight = False
 
@@ -647,6 +1381,7 @@ def main():
     print("  [Q / E]          Manual Yaw (Rotate)")
     print("  [T / Spc]        Take Off")
     print("  [L]              Land")
+    print("  [R]              Reset Rock-Paper-Scissors Duel (Rematch)")
     print("  [+ / -]          Step Distance (+/- 5cm)")
     print("  [Esc / X]        Exit")
     print("-" * 65 + "\n")
@@ -655,6 +1390,7 @@ def main():
         while running:
             frame = video.get_frame()
             if frame is None:
+                gaze_info = None
                 if is_simulator:
                     display_frame = create_standby_frame(1024, 576, f"Waiting for Laptop Camera #{args.camera}...")
                 else:
@@ -668,17 +1404,54 @@ def main():
                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
                     recognition_result = recognizer.recognize(mp_image)
 
+                    # Extract all recognized hands with positions for RPS referee and multi-person tracking
+                    all_detected_hands = []
+                    h_frame, w_frame, _ = frame.shape
+                    if recognition_result.gestures:
+                        for idx_hand, gesture_list in enumerate(recognition_result.gestures):
+                            if len(gesture_list) > 0 and idx_hand < len(recognition_result.hand_landmarks):
+                                top_g = gesture_list[0]
+                                lm_list = recognition_result.hand_landmarks[idx_hand]
+                                cx_hand = float(np.mean([pt.x * w_frame for pt in lm_list]))
+                                cy_hand = float(np.mean([pt.y * h_frame for pt in lm_list]))
+                                all_detected_hands.append({
+                                    "label": top_g.category_name,
+                                    "score": top_g.score,
+                                    "cx": cx_hand,
+                                    "cy": cy_hand,
+                                    "landmarks": lm_list
+                                })
+
+                    # Run Two-Player Rock-Paper-Scissors Referee
+                    rps_info = rps_game.process(frame, all_detected_hands)
+
+                    # Select controlling hand:
+                    # If 2 people are in frame, only the RPS winner has control!
                     detected_label = "None"
                     detected_score = 0.0
                     hand_landmarks = None
 
-                    if recognition_result.gestures and len(recognition_result.gestures[0]) > 0:
-                        top_gesture = recognition_result.gestures[0][0]
-                        detected_label = top_gesture.category_name
-                        detected_score = top_gesture.score
+                    active_ctrl = rps_info.get("active_controller", "SINGLE")
+                    p1_box = rps_info.get("p1_box")
+                    p2_box = rps_info.get("p2_box")
 
-                    if recognition_result.hand_landmarks and len(recognition_result.hand_landmarks) > 0:
-                        hand_landmarks = recognition_result.hand_landmarks[0]
+                    valid_hands = []
+                    if rps_info.get("active", False):
+                        if active_ctrl in ("P1", "P2") and p1_box and p2_box:
+                            mid_div = (p1_box[0] + p1_box[2] + p2_box[0] + p2_box[2]) / 4.0
+                            for h_item in all_detected_hands:
+                                if active_ctrl == "P1" and h_item["cx"] < mid_div:
+                                    valid_hands.append(h_item)
+                                elif active_ctrl == "P2" and h_item["cx"] >= mid_div:
+                                    valid_hands.append(h_item)
+                    else:
+                        valid_hands = all_detected_hands
+
+                    if len(valid_hands) > 0:
+                        top_hand = valid_hands[0]
+                        detected_label = top_hand["label"]
+                        detected_score = top_hand["score"]
+                        hand_landmarks = top_hand["landmarks"]
 
                     now = time.time()
                     hand_detected = (hand_landmarks is not None) or (detected_score >= args.min_score and detected_label != "None")
@@ -709,11 +1482,14 @@ def main():
                         else:
                             current_posture = "TRANSITION"
 
+                    # When an RPS match is in progress (countdown or resolving), disable flight gestures!
+                    rps_match_in_progress = rps_info.get("active", False) and (rps_info.get("state") in ("COUNTDOWN", "RESOLVING"))
+
                     # Handle transitions: Closing Hand -> Forward, Opening Hand -> Backward
                     if current_posture == "CLOSED":
                         if last_stable_posture == "OPEN":
                             # User closed their hand! (Open -> Closed) -> MOVE FORWARD
-                            if now - last_command_time >= command_interval:
+                            if not rps_match_in_progress and (now - last_command_time >= command_interval):
                                 last_command_time = now
                                 last_transition_event = "OPEN_TO_CLOSED"
                                 last_transition_time = now
@@ -747,7 +1523,7 @@ def main():
                     elif current_posture == "OPEN":
                         if last_stable_posture == "CLOSED":
                             # User opened their hand! (Closed -> Open) -> MOVE BACKWARD
-                            if now - last_command_time >= command_interval:
+                            if not rps_match_in_progress and (now - last_command_time >= command_interval):
                                 last_command_time = now
                                 last_transition_event = "CLOSED_TO_OPEN"
                                 last_transition_time = now
@@ -780,15 +1556,20 @@ def main():
 
                     elif current_posture in ("Thumb_Up", "Thumb_Down"):
                         last_stable_posture = None
-                        if current_posture == "Thumb_Up" and (now - last_command_time >= command_interval):
-                            last_command_time = now
-                            do_action(lambda: client.moveUp(step_dist), f"Gesture: Move Up {int(step_dist*100)}cm", delta=(0.0, 0.0, step_dist))
-                        elif current_posture == "Thumb_Down" and (now - last_command_time >= command_interval):
-                            last_command_time = now
-                            do_action(lambda: client.moveDown(step_dist), f"Gesture: Move Down {int(step_dist*100)}cm", delta=(0.0, 0.0, -step_dist))
+                        if not rps_match_in_progress:
+                            if current_posture == "Thumb_Up" and (now - last_command_time >= command_interval):
+                                last_command_time = now
+                                do_action(lambda: client.moveUp(step_dist), f"Gesture: Move Up {int(step_dist*100)}cm", delta=(0.0, 0.0, step_dist))
+                            elif current_posture == "Thumb_Down" and (now - last_command_time >= command_interval):
+                                last_command_time = now
+                                do_action(lambda: client.moveDown(step_dist), f"Gesture: Move Down {int(step_dist*100)}cm", delta=(0.0, 0.0, -step_dist))
 
                     # Prepare gesture_info for HUD display
-                    if now - last_transition_time < 1.2 and last_transition_event == "OPEN_TO_CLOSED":
+                    if rps_match_in_progress:
+                        gesture_info["label"] = "RPS_Match"
+                        gesture_info["score"] = 0.0
+                        gesture_info["action"] = "DUEL_IN_PROGRESS"
+                    elif now - last_transition_time < 1.2 and last_transition_event == "OPEN_TO_CLOSED":
                         gesture_info["label"] = "Closing_Hand"
                         gesture_info["score"] = detected_score if detected_score > 0 else 0.95
                         gesture_info["action"] = "FORWARD"
@@ -826,7 +1607,50 @@ def main():
                     gesture_info["score"] = 0.0
                     gesture_info["action"] = "PAUSED"
 
+                # Run Gaze Tracking to detect if user is looking straight at camera
+                try:
+                    gaze_info = gaze_tracker.process(frame)
+                except Exception as e:
+                    gaze_info = {
+                        "face_detected": False,
+                        "looking_at_camera": False,
+                        "direction": "NO FACE DETECTED",
+                        "confidence": 0.0,
+                        "yaw": 0.0,
+                        "pitch": 0.0,
+                        "roll": 0.0,
+                        "iris_h": 0.50,
+                        "iris_v": 0.50,
+                        "iris_left": None,
+                        "iris_right": None
+                    }
+
+                # --- Haptic Vibration Trigger ---
+                # When user's gaze is CLEARLY not focused on camera (distinctly left, right, up, down, or head turned)
+                # and user holds a thumb up, thumbs down, thumbs left, or thumbs right (held stable for hold_time),
+                # trigger the wireless vibration motor!
+                thumb_dir = classify_thumb_direction(hand_landmarks, detected_label)
+                gaze_clearly_averted = gaze_info.get("face_detected", False) and gaze_info.get("clear_averted", False)
+                gaze_dir_label = gaze_info.get("direction", "AVERTED")
+
+                # Debounce: Ensure user is deliberately holding the thumb gesture (not a transient fist transition)
+                if thumb_dir in ("THUMB_UP", "THUMB_DOWN", "THUMB_LEFT", "THUMB_RIGHT"):
+                    if candidate_thumb_dir == thumb_dir:
+                        # Verified thumb gesture held stable
+                        if (now - candidate_thumb_since >= max(0.20, args.hold_time)) and gaze_clearly_averted:
+                            triggered = vibration_controller.trigger_buzz_async(duration=0.30, intensity=255, cooldown=0.80)
+                            if triggered:
+                                last_haptic_buzz_time = now
+                                last_action = f"⚡ HAPTIC MOTOR BUZZ: {thumb_dir} (Gaze: {gaze_dir_label})"
+                                print(f"\n>> {last_action}\n")
+                    else:
+                        candidate_thumb_dir = thumb_dir
+                        candidate_thumb_since = now
+                else:
+                    candidate_thumb_dir = None
+
             # Draw HUD
+            haptic_is_active = (time.time() - last_haptic_buzz_time) < 0.50
             cur_dist = np.sqrt(rel_x**2 + rel_y**2 + rel_z**2) if default_point_set else 0.0
             safety_info = {
                 "set": default_point_set,
@@ -836,7 +1660,20 @@ def main():
                 "dist": cur_dist,
                 "max": max_boundary
             }
-            hud_frame = draw_hud(display_frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, safety_info, last_action)
+            hud_frame = draw_hud(
+                display_frame,
+                telemetry,
+                step_dist,
+                gesture_info,
+                estop,
+                gesture_enabled,
+                movement_enabled,
+                safety_info,
+                gaze_info=gaze_info,
+                rps_info=rps_info if 'rps_info' in locals() else None,
+                last_action=last_action,
+                haptic_active=haptic_is_active
+            )
             cv2.imshow(window_name, hud_frame)
 
             # Key check
@@ -845,6 +1682,11 @@ def main():
             if key in (27, ord('x'), ord('X')):
                 print("Exit requested. Quitting...")
                 break
+
+            elif key in (ord('r'), ord('R')):
+                rps_game.reset_duel()
+                last_action = "ROCK-PAPER-SCISSORS DUEL RESET! Rematch starting..."
+                print(f"\n>> {last_action}\n")
 
             elif key in (ord('h'), ord('H')):
                 default_point_set = True
@@ -928,6 +1770,10 @@ def main():
         print("\nInterrupt received. Exiting...")
     finally:
         running = False
+        try:
+            vibration_controller.close()
+        except Exception:
+            pass
         video.stop()
         cv2.destroyAllWindows()
 
