@@ -5,6 +5,7 @@ K	Clear Default Point (Disable Safety Box)
 M	Enable / Disable Drone Physical Movement (Dry Run Mode)
 Space	Emergency Stop / Pause Gesture Tracking Toggle
 G	Toggle Gesture Recognition Tracking (On / Off)
+Y	Toggle Minimal Gaze Tracking Mode (Hide all UI, edge gaze tracking only)
 I	Invert Forward / Backward Translation Direction
 W / S	Move Forward / Backward (by forward step distance, default 40cm)
 A / D	Move Left / Right (by lateral step distance, default 30cm)

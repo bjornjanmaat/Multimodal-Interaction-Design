@@ -644,19 +644,33 @@ class GazeTracker:
             is_clear_look_down
         )
 
-        # Determine gaze direction label (Antoine Lamé style: Center / Left / Right / Up / Down)
+        # Determine explicit directional excursion (combining iris position and head pose)
+        is_looking_left = bool((self.smooth_h < 0.34 or self.smooth_head_offset < -0.16) and not looking_straight)
+        is_looking_right = bool((self.smooth_h > 0.62 or self.smooth_head_offset > 0.16) and not looking_straight)
+        is_looking_up = bool(self.smooth_v < 0.24 and not looking_straight)
+        is_looking_down = bool(self.smooth_v > 0.68 and not looking_straight)
+
+        # Determine gaze direction label (Center / Left / Right / Up / Down / Diagonal)
         if looking_straight:
             direction = "CENTER (LOOKING AT CAMERA)"
-        elif abs(self.smooth_head_offset) > 0.17:
-            direction = "LOOKING AWAY (HEAD TURNED)"
-        elif self.smooth_h > 0.62:
-            direction = "LOOKING RIGHT"
-        elif self.smooth_h < 0.32:
+        elif is_looking_left and is_looking_up:
+            direction = "LOOKING TOP-LEFT"
+        elif is_looking_right and is_looking_up:
+            direction = "LOOKING TOP-RIGHT"
+        elif is_looking_left and is_looking_down:
+            direction = "LOOKING BOTTOM-LEFT"
+        elif is_looking_right and is_looking_down:
+            direction = "LOOKING BOTTOM-RIGHT"
+        elif is_looking_left:
             direction = "LOOKING LEFT"
-        elif self.smooth_v < 0.24:
+        elif is_looking_right:
+            direction = "LOOKING RIGHT"
+        elif is_looking_up:
             direction = "LOOKING UP"
-        else:
+        elif is_looking_down:
             direction = "LOOKING DOWN"
+        else:
+            direction = "LOOKING AWAY"
 
         # Continuous confidence metric
         h_dev = abs(self.smooth_h - 0.46) / 0.18
@@ -669,12 +683,18 @@ class GazeTracker:
             "looking_at_camera": looking_straight,
             "clear_averted": clear_averted,
             "direction": direction,
+            "looking_left": is_looking_left,
+            "looking_right": is_looking_right,
+            "looking_up": is_looking_up,
+            "looking_down": is_looking_down,
             "horizontal_ratio": self.smooth_h,
             "vertical_ratio": self.smooth_v,
             "head_offset": self.smooth_head_offset,
             "confidence": confidence,
             "iris_left": final_pl,
-            "iris_right": final_pr
+            "iris_right": final_pr,
+            "eye_contour_left": reg_l,
+            "eye_contour_right": reg_r
         }
 
 
@@ -1022,6 +1042,120 @@ class RockPaperScissorsGame:
         print("\n🏆 [RPS DUEL] PLAYER 1 WINS! Control granted to Player 1.")
 
 
+def draw_gaze_tracking_overlay(frame, gaze_info, minimal_mode=True):
+    """
+    Renders gaze tracking visual indicators:
+      1. Eye pupil/iris tracking reticles & crosshairs on both eyes.
+      2. Eye contour polygon outlines.
+      3. Screen edge indicator rectangles (red) when looking Left, Right, Up, or Down.
+      4. Floating gaze status HUD card and minimal mode badge.
+    """
+    if frame is None:
+        return frame
+
+    if not gaze_info or not gaze_info.get("face_detected", False):
+        if minimal_mode:
+            h, w, _ = frame.shape
+            overlay = frame.copy()
+            card_w, card_h = 360, 56
+            cx, cy = 24, 24
+            cv2.rectangle(overlay, (cx, cy), (cx + card_w, cy + card_h), (25, 25, 30), -1)
+            cv2.rectangle(overlay, (cx, cy), (cx + card_w, cy + card_h), (80, 80, 80), 1)
+            cv2.putText(overlay, "👀 GAZE: NO FACE DETECTED", (cx + 12, cy + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (140, 140, 140), 2)
+            cv2.putText(overlay, "Position face in frame | [Y] Exit Gaze Mode", (cx + 12, cy + 46), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (180, 180, 180), 1)
+            return cv2.addWeighted(overlay, 0.85, frame, 0.15, 0)
+        return frame
+
+    h, w, _ = frame.shape
+    overlay = frame.copy()
+
+    is_looking = gaze_info.get("looking_at_camera", False)
+    direction = gaze_info.get("direction", "UNKNOWN")
+    conf = gaze_info.get("confidence", 0.0)
+    h_ratio = gaze_info.get("horizontal_ratio", 0.50)
+    v_ratio = gaze_info.get("vertical_ratio", 0.50)
+
+    # 1. Draw subtle eyelid/contour polygons around eye sockets
+    eye_l_poly = gaze_info.get("eye_contour_left")
+    eye_r_poly = gaze_info.get("eye_contour_right")
+    contour_col = (0, 255, 140) if is_looking else (0, 180, 255)
+    if eye_l_poly is not None and len(eye_l_poly) > 0:
+        cv2.polylines(overlay, [eye_l_poly], True, contour_col, 1)
+    if eye_r_poly is not None and len(eye_r_poly) > 0:
+        cv2.polylines(overlay, [eye_r_poly], True, contour_col, 1)
+
+    # 2. Draw pupil/iris reticles and crosshairs
+    iris_l = gaze_info.get("iris_left")
+    iris_r = gaze_info.get("iris_right")
+    reticle_color = (0, 255, 120) if is_looking else (0, 140, 255)
+
+    for iris_pt in (iris_l, iris_r):
+        if iris_pt and iris_pt[0] > 0 and iris_pt[1] > 0:
+            cv2.circle(overlay, iris_pt, 4, reticle_color, -1)
+            cv2.circle(overlay, iris_pt, 9, reticle_color, 1)
+            cv2.line(overlay, (iris_pt[0] - 12, iris_pt[1]), (iris_pt[0] + 12, iris_pt[1]), reticle_color, 1)
+            cv2.line(overlay, (iris_pt[0], iris_pt[1] - 12), (iris_pt[0], iris_pt[1] + 12), reticle_color, 1)
+
+    # 3. Screen Edge Indicators (Red Rectangles: 30% width on sides, 10% height on top/bottom)
+    w_lr = int(w * 0.30)  # 30% of screen width for Left & Right
+    h_tb = int(h * 0.10)  # 10% of screen height for Top & Bottom
+
+    is_left = gaze_info.get("looking_left", False)
+    is_right = gaze_info.get("looking_right", False)
+    is_up = gaze_info.get("looking_up", False)
+    is_down = gaze_info.get("looking_down", False)
+
+    dir_str = direction.upper()
+    if not (is_left or is_right or is_up or is_down):
+        if "LEFT" in dir_str:
+            is_left = True
+        elif "RIGHT" in dir_str:
+            is_right = True
+        if "UP" in dir_str or "TOP" in dir_str:
+            is_up = True
+        elif "DOWN" in dir_str or "BOTTOM" in dir_str:
+            is_down = True
+
+    red_color = (0, 0, 255)      # Vibrant solid Red (BGR)
+    border_color = (30, 30, 220) # Accent border
+
+    if is_left:
+        cv2.rectangle(overlay, (0, 0), (w_lr, h), red_color, -1)
+        cv2.rectangle(overlay, (0, 0), (w_lr, h), border_color, 3)
+    if is_right:
+        cv2.rectangle(overlay, (w - w_lr, 0), (w, h), red_color, -1)
+        cv2.rectangle(overlay, (w - w_lr, 0), (w, h), border_color, 3)
+    if is_up:
+        cv2.rectangle(overlay, (0, 0), (w, h_tb), red_color, -1)
+        cv2.rectangle(overlay, (0, 0), (w, h_tb), border_color, 3)
+    if is_down:
+        cv2.rectangle(overlay, (0, h - h_tb), (w, h), red_color, -1)
+        cv2.rectangle(overlay, (0, h - h_tb), (w, h), border_color, 3)
+
+    # 4. In Minimal Gaze Mode: Floating Gaze HUD Card
+    if minimal_mode:
+        card_w, card_h = 390, 84
+        card_x, card_y = 24, 24
+        cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (25, 25, 30), -1)
+        cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (80, 80, 80), 1)
+
+        gz_color = (0, 255, 120) if is_looking else (0, 140, 255)
+        gz_title = "👀 GAZE: LOOKING AT CAMERA" if is_looking else f"👀 GAZE: {direction}"
+        gz_sub = f"Ratio: H:{h_ratio:.2f} V:{v_ratio:.2f} | Conf: {conf:.0%}"
+        gz_hint = "[Y] Toggle Full Drone Flight UI"
+
+        cv2.putText(overlay, gz_title, (card_x + 12, card_y + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, gz_color, 2)
+        cv2.putText(overlay, gz_sub, (card_x + 12, card_y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1)
+        cv2.putText(overlay, gz_hint, (card_x + 12, card_y + 72), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1)
+        cv2.circle(overlay, (card_x + card_w - 22, card_y + 24), 8, gz_color, -1)
+
+    alpha = 0.85
+    return cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
+
+# Backwards compatibility alias
+draw_gaze_edge_indicators = draw_gaze_tracking_overlay
+
+
 def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, safety_info, gaze_info=None, rps_info=None, last_action="", haptic_active=False):
     """Draws rich aviation HUD with gesture indicators directly onto video frame."""
     h, w, _ = frame.shape
@@ -1235,10 +1369,43 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
             reticle_color = (0, 255, 120) if is_looking else (0, 165, 255)
             if iris_l and iris_l[0] > 0 and iris_l[1] > 0:
                 cv2.circle(overlay, iris_l, 4, reticle_color, -1)
-                cv2.circle(overlay, iris_l, 8, reticle_color, 1)
+                cv2.circle(overlay, iris_l, 9, reticle_color, 1)
+                cv2.line(overlay, (iris_l[0] - 12, iris_l[1]), (iris_l[0] + 12, iris_l[1]), reticle_color, 1)
+                cv2.line(overlay, (iris_l[0], iris_l[1] - 12), (iris_l[0], iris_l[1] + 12), reticle_color, 1)
             if iris_r and iris_r[0] > 0 and iris_r[1] > 0:
                 cv2.circle(overlay, iris_r, 4, reticle_color, -1)
-                cv2.circle(overlay, iris_r, 8, reticle_color, 1)
+                cv2.circle(overlay, iris_r, 9, reticle_color, 1)
+                cv2.line(overlay, (iris_r[0] - 12, iris_r[1]), (iris_r[0] + 12, iris_r[1]), reticle_color, 1)
+                cv2.line(overlay, (iris_r[0], iris_r[1] - 12), (iris_r[0], iris_r[1] + 12), reticle_color, 1)
+
+            # Draw eyelid contours
+            eye_l_poly = gaze_info.get("eye_contour_left")
+            eye_r_poly = gaze_info.get("eye_contour_right")
+            contour_col = (0, 255, 140) if is_looking else (0, 180, 255)
+            if eye_l_poly is not None and len(eye_l_poly) > 0:
+                cv2.polylines(overlay, [eye_l_poly], True, contour_col, 1)
+            if eye_r_poly is not None and len(eye_r_poly) > 0:
+                cv2.polylines(overlay, [eye_r_poly], True, contour_col, 1)
+
+            # Draw edge indicators when looking towards any edge (30% width on sides, 10% height on top/bottom)
+            w_lr = int(w * 0.30)
+            h_tb = int(h * 0.10)
+            is_l = gaze_info.get("looking_left", False) or "LEFT" in direction.upper()
+            is_r = gaze_info.get("looking_right", False) or "RIGHT" in direction.upper()
+            is_u = gaze_info.get("looking_up", False) or "UP" in direction.upper()
+            is_d = gaze_info.get("looking_down", False) or "DOWN" in direction.upper()
+            if is_l:
+                cv2.rectangle(overlay, (0, 0), (w_lr, h), (0, 0, 255), -1)
+                cv2.rectangle(overlay, (0, 0), (w_lr, h), (30, 30, 220), 3)
+            if is_r:
+                cv2.rectangle(overlay, (w - w_lr, 0), (w, h), (0, 0, 255), -1)
+                cv2.rectangle(overlay, (w - w_lr, 0), (w, h), (30, 30, 220), 3)
+            if is_u:
+                cv2.rectangle(overlay, (0, 0), (w, h_tb), (0, 0, 255), -1)
+                cv2.rectangle(overlay, (0, 0), (w, h_tb), (30, 30, 220), 3)
+            if is_d:
+                cv2.rectangle(overlay, (0, h - h_tb), (w, h), (0, 0, 255), -1)
+                cv2.rectangle(overlay, (0, h - h_tb), (w, h), (30, 30, 220), 3)
 
         # --- Haptic Vibration Alert Indicator ---
         if haptic_active:
@@ -1575,6 +1742,7 @@ def main():
 
     estop = False              # Emergency Stop toggle
     gesture_enabled = True     # Gesture control enable toggle
+    gaze_only_mode = False     # Minimal Gaze Mode (Hide all UI, edge tracking only)
     movement_enabled = not args.dry_run  # Physical drone movement toggle
     last_command_time = 0.0
     last_haptic_buzz_time = 0.0
@@ -1667,6 +1835,7 @@ def main():
     print("  [M]                     Toggle Drone Movement ON/OFF (Dry Run Mode)")
     print("  [SPACE]          E-Stop / Pause Gesture Control")
     print("  [G]              Toggle Gesture Tracking On/Off")
+    print("  [Y]              Toggle Minimal Gaze Mode (Hide all UI, edge tracking only)")
     print(f"  [W / S]          Manual Forward / Backward ({int(step_fb*100)}cm)")
     print(f"  [A / D]          Manual Left / Right ({int(step_lat*100)}cm)")
     print(f"  [U / J]          Manual Altitude Up / Down ({int(step_vert*100)}cm)")
@@ -1690,6 +1859,30 @@ def main():
                     display_frame = create_standby_frame(1024, 576, f"Waiting for Drone RTSP Stream: {rtsp_url}")
             else:
                 display_frame = frame
+
+                # Minimal Gaze Mode: All UI and flight gestures hidden, gaze edge indicators only
+                if gaze_only_mode:
+                    try:
+                        gaze_info = gaze_tracker.process(frame)
+                    except Exception:
+                        gaze_info = None
+                    display_frame = draw_gaze_edge_indicators(frame.copy(), gaze_info)
+                    cv2.imshow(window_name, display_frame)
+
+                    # Key check in gaze-only mode
+                    key = cv2.waitKey(25) & 0xFF
+                    if key in (27, ord('x'), ord('X')):
+                        print("Exit requested. Quitting...")
+                        break
+                    elif key in (ord('y'), ord('Y')):
+                        gaze_only_mode = False
+                        last_action = "GAZE-ONLY MODE DEACTIVATED (Full UI Restored)"
+                        print(f"\n>> {last_action}\n")
+                    elif key == ord(' '):
+                        estop = not estop
+                        last_action = "E-STOP ACTIVATED [Gestures Paused]" if estop else "E-STOP RELEASED [Gestures Resumed]"
+                        print(f">> {last_action}")
+                    continue
 
                 # Run MediaPipe Gesture Recognizer on incoming frame
                 if gesture_enabled and not estop:
@@ -1932,7 +2125,12 @@ def main():
                     gaze_info = {
                         "face_detected": False,
                         "looking_at_camera": False,
+                        "clear_averted": False,
                         "direction": "NO FACE DETECTED",
+                        "looking_left": False,
+                        "looking_right": False,
+                        "looking_up": False,
+                        "looking_down": False,
                         "confidence": 0.0,
                         "yaw": 0.0,
                         "pitch": 0.0,
@@ -2043,6 +2241,11 @@ def main():
                 gesture_enabled = not gesture_enabled
                 last_action = f"Gesture Tracking {'ENABLED' if gesture_enabled else 'DISABLED'}"
                 print(f">> {last_action}")
+
+            elif key in (ord('y'), ord('Y')):
+                gaze_only_mode = True
+                last_action = "GAZE-ONLY MODE ACTIVATED (All UI Hidden, Edge Tracking Only)"
+                print(f"\n>> {last_action}\n")
 
             elif key in (ord('w'), ord('W')):
                 do_action(lambda: client.moveForward(step_fb), f"Manual Move Forward {int(step_fb*100)}cm", delta=(step_fb, 0.0, 0.0))
