@@ -30,10 +30,12 @@ Run with project virtualenv:
 import os
 import sys
 import time
+import math
 import socket
 import threading
 import argparse
 from collections import deque
+import random
 
 # Suppress noisy FFmpeg macroblock decode warnings and force TCP transport for robust RTSP
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "-8"
@@ -340,6 +342,75 @@ def compute_hand_openness(landmarks):
         return 1.4
 
 
+def classify_rps_hand(hand_data):
+    """
+    Classifies Rock (✊), Paper (✋), or Scissors (✌️) using both
+    MediaPipe classifier labels and geometric finger joint landmark analysis.
+    Ensures that two hands can be reliably recognized simultaneously.
+    """
+    lbl = hand_data.get("label", "None")
+    if lbl == "Closed_Fist":
+        return "ROCK"
+    elif lbl == "Open_Palm":
+        return "PAPER"
+    elif lbl == "Victory":
+        return "SCISSORS"
+    elif lbl in ("Thumb_Up", "Thumb_Down"):
+        return "ROCK"
+
+    # Geometric landmark analysis from hand joints
+    lm = hand_data.get("landmarks")
+    if lm and len(lm) >= 21:
+        try:
+            w_pt = np.array([lm[0].x, lm[0].y, lm[0].z])
+
+            # Finger definitions: (tip_idx, pip_idx, mcp_idx)
+            # Index: (8, 6, 5), Middle: (12, 10, 9), Ring: (16, 14, 13), Pinky: (20, 18, 17)
+            fingers = [(8, 6, 5), (12, 10, 9), (16, 14, 13), (20, 18, 17)]
+            extended = []
+            for tip_idx, pip_idx, mcp_idx in fingers:
+                tip = np.array([lm[tip_idx].x, lm[tip_idx].y, lm[tip_idx].z])
+                pip = np.array([lm[pip_idx].x, lm[pip_idx].y, lm[pip_idx].z])
+                mcp = np.array([lm[mcp_idx].x, lm[mcp_idx].y, lm[mcp_idx].z])
+
+                d_tip_w = np.linalg.norm(tip - w_pt)
+                d_pip_w = np.linalg.norm(pip - w_pt)
+                d_tip_mcp = np.linalg.norm(tip - mcp)
+                d_pip_mcp = np.linalg.norm(pip - mcp)
+
+                # Extended if tip is further from wrist and mcp than pip knuckle
+                is_ext = (d_tip_w > d_pip_w) and (d_tip_mcp > d_pip_mcp * 0.95)
+                extended.append(is_ext)
+
+            idx_ext, mid_ext, ring_ext, pnk_ext = extended
+            num_ext = sum(extended)
+
+            d_idx_w = np.linalg.norm(np.array([lm[8].x, lm[8].y, lm[8].z]) - w_pt)
+            d_mid_w = np.linalg.norm(np.array([lm[12].x, lm[12].y, lm[12].z]) - w_pt)
+            d_rng_w = np.linalg.norm(np.array([lm[16].x, lm[16].y, lm[16].z]) - w_pt)
+            d_pnk_w = np.linalg.norm(np.array([lm[20].x, lm[20].y, lm[20].z]) - w_pt)
+
+            # Scissors: Index and Middle extended, Ring and Pinky folded
+            if idx_ext and mid_ext and not ring_ext and not pnk_ext:
+                return "SCISSORS"
+            if idx_ext and mid_ext and num_ext == 2:
+                return "SCISSORS"
+            if (d_idx_w + d_mid_w) > 1.30 * (d_rng_w + d_pnk_w + 1e-6) and idx_ext and mid_ext:
+                return "SCISSORS"
+
+            # Paper: 3 or 4 fingers extended
+            if num_ext >= 3:
+                return "PAPER"
+
+            # Rock: 0 or 1 finger extended (fist)
+            if num_ext <= 1:
+                return "ROCK"
+        except Exception:
+            pass
+
+    return "NONE"
+
+
 def map_duration_to_speed(duration, min_speed=0.15, max_speed=0.80, min_dur=0.12, max_dur=0.65):
     """Maps gesture transition duration to drone flight speed in m/s."""
     d_clamped = min(max(duration, min_dur), max_dur)
@@ -370,9 +441,9 @@ def init_mediapipe_recognizer(model_path):
         base_options=BaseOptions(model_asset_path=model_path),
         running_mode=RunningMode.IMAGE,
         num_hands=4,
-        min_hand_detection_confidence=0.5,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5
+        min_hand_detection_confidence=0.35,
+        min_hand_presence_confidence=0.35,
+        min_tracking_confidence=0.35
     )
     return GestureRecognizer.create_from_options(options)
 
@@ -590,19 +661,115 @@ class GazeTracker:
         }
 
 
+class ConfettiEffect:
+    """
+    Celebratory animated confetti particle system on Player 1's side of the screen.
+    Simulates floating, swaying, and spinning confetti flakes and sparkles.
+    """
+    COLORS = [
+        (0, 215, 255),   # Gold / Yellow
+        (50, 255, 100),  # Emerald Green
+        (255, 255, 0),   # Bright Cyan
+        (200, 50, 255),  # Magenta / Hot Pink
+        (255, 180, 0),   # Sky Blue
+        (0, 140, 255),   # Vibrant Orange
+        (255, 50, 150),  # Neon Violet
+        (0, 255, 255),   # Pure Yellow
+        (255, 255, 255), # White Star
+    ]
+
+    def __init__(self, num_particles=150):
+        self.num_particles = num_particles
+        self.particles = []
+        self._initialized = False
+
+    def reset(self, width, height):
+        self.particles = []
+        max_x = int(width * 0.49)
+        for _ in range(self.num_particles):
+            self.particles.append(self._spawn_particle(max_x, height, random_y=True))
+        self._initialized = True
+
+    def _spawn_particle(self, max_x, height, random_y=False):
+        return {
+            "x": float(random.randint(10, max(20, max_x))),
+            "y": float(random.randint(-height, 0)) if not random_y else float(random.randint(-height // 3, height)),
+            "vx": random.uniform(-1.0, 1.0),
+            "vy": random.uniform(3.5, 7.5),
+            "w": float(random.choice([6, 8, 10, 12])),
+            "h": float(random.choice([4, 6, 8, 10])),
+            "angle": float(random.randint(0, 360)),
+            "v_rot": random.uniform(-7.0, 7.0),
+            "color": random.choice(self.COLORS),
+            "sway_phase": random.uniform(0.0, 6.28),
+            "is_sparkle": random.random() < 0.22
+        }
+
+    def update_and_draw(self, frame_or_overlay, width, height, current_time):
+        max_x = int(width * 0.49)
+        if not self._initialized or len(self.particles) < self.num_particles:
+            self.reset(width, height)
+
+        for p in self.particles:
+            # Physics: gravity, sway, rotation
+            p["y"] += p["vy"]
+            p["x"] += p["vx"] + math.sin(current_time * 3.5 + p["sway_phase"]) * 1.5
+            p["angle"] += p["v_rot"]
+
+            # Wrap around when falling past bottom
+            if p["y"] > height + 20:
+                p["y"] = float(random.randint(-40, -10))
+                p["x"] = float(random.randint(10, max_x))
+                p["vy"] = random.uniform(3.5, 7.5)
+
+            # Keep within Player 1's side (left half)
+            if p["x"] < 8:
+                p["x"] = 8.0
+                p["vx"] = abs(p["vx"])
+            elif p["x"] > max_x:
+                p["x"] = float(max_x)
+                p["vx"] = -abs(p["vx"])
+
+            x, y = int(p["x"]), int(p["y"])
+            if y < -15 or y >= height:
+                continue
+
+            if p["is_sparkle"]:
+                r = int(p["w"] / 2.5)
+                cv2.circle(frame_or_overlay, (x, y), max(2, r), p["color"], -1)
+            else:
+                cos_a = math.cos(math.radians(p["angle"]))
+                sin_a = math.sin(math.radians(p["angle"]))
+                hw = p["w"] / 2.0
+                hh = p["h"] / 2.0
+                pts = np.array([
+                    [int(x - hw * cos_a + hh * sin_a), int(y - hw * sin_a - hh * cos_a)],
+                    [int(x + hw * cos_a + hh * sin_a), int(y + hw * sin_a - hh * cos_a)],
+                    [int(x + hw * cos_a - hh * sin_a), int(y + hw * sin_a + hh * cos_a)],
+                    [int(x - hw * cos_a - hh * sin_a), int(y - hw * sin_a + hh * cos_a)]
+                ], dtype=np.int32)
+                cv2.fillPoly(frame_or_overlay, [pts], p["color"])
+
+
+# Global confetti effect instance
+confetti_effect = ConfettiEffect(num_particles=150)
+
+
 class RockPaperScissorsGame:
     """
-    Two-Player Rock-Paper-Scissors Referee for Drone Control.
-    When two people (faces) are detected in frame:
-      - Initiates an interactive duel countdown (3... 2... 1... SHOOT!).
+    Rock-Paper-Scissors Referee for Drone Control.
+    The application starts in a WAITING state where NO flight gestures are recognized.
+    When the user presses [R] on the keyboard:
+      - Starts a 5-second countdown (5... 4... 3... 2... 1... SHOOT!).
       - Reads each player's gesture:
           * Rock: Closed_Fist (✊)
           * Paper: Open_Palm (✋)
           * Scissors: Victory (✌️)
-      - Resolves the winner (Player 1 vs Player 2).
-      - Hands over drone gesture flight control exclusively to the winner!
-      - If tie, initiates an instant rematch.
-      - If one person later leaves or returns, maintains or re-arbitrates ownership.
+      - If 2 players are detected: Player 1 (Left) vs Player 2 (Right).
+      - If 1 player is detected: Player 1 (User) vs Drone AI Opponent.
+      - Resolves the winner according to classic RPS rules.
+      - Displays the winner and grants exclusive drone flight gesture control to the winner!
+      - Press [R] at any time for a rematch.
     """
     GESTURE_MAP = {
         "Closed_Fist": "ROCK",
@@ -621,25 +788,40 @@ class RockPaperScissorsGame:
         self.mp_face_detection = mp.solutions.face_detection
         self.face_detector = self.mp_face_detection.FaceDetection(min_detection_confidence=0.5, model_selection=0)
 
-        # Game state: "IDLE", "COUNTDOWN", "RESOLVING", "WINNER"
-        self.state = "IDLE"
-        self.active_controller = "SINGLE"  # "P1", "P2", or "SINGLE"
-        self.winner = None                 # "P1", "P2", or None
+        # Game state: "WAITING", "COUNTDOWN", "WINNER"
+        self.state = "WAITING"
+        self.active_controller = None  # None until RPS is won ("P1" or "P2")
+        self.winner = None             # "P1", "P2", "TIE", or None
         self.winner_announce_time = 0.0
 
-        # Countdown management
+        # Countdown management (5 seconds)
         self.countdown_start = 0.0
-        self.countdown_duration = 3.5      # 3.5 seconds countdown
-        self.last_two_face_time = 0.0
+        self.countdown_duration = 5.0
         self.face_count = 0
-        self.face_boxes = []              # [(x1, y1, x2, y2, player_id)]
+        self.mode = "2_PLAYER"
 
         # Moves
         self.p1_move = "NONE"
         self.p2_move = "NONE"
         self.p1_box = None
         self.p2_box = None
-        self.duel_result_text = ""
+        self.duel_result_text = "Press [R] on keyboard to start Rock-Paper-Scissors!"
+
+    def start_duel(self):
+        """Starts the 5-second countdown duel when user presses key [R]."""
+        self.state = "COUNTDOWN"
+        self.countdown_start = time.time()
+        self.countdown_duration = 5.0
+        self.winner = None
+        self.active_controller = None
+        self.p1_move = "NONE"
+        self.p2_move = "NONE"
+        self.duel_result_text = "⚔️ DUEL STARTED! 5-second countdown..."
+        print("\n🎮 [RPS DUEL] Rock-Paper-Scissors started! Counting down from 5 seconds...")
+
+    def reset_duel(self):
+        """Alias for start_duel() to rematch."""
+        self.start_duel()
 
     def process(self, frame_bgr, hands_data):
         """
@@ -666,152 +848,161 @@ class RockPaperScissorsGame:
                 cx = (x1 + x2) / 2.0
                 detected_faces.append({"box": (x1, y1, x2, y2), "cx": cx})
 
-        # Sort detected faces left to right across camera view
         detected_faces = sorted(detected_faces, key=lambda f: f["cx"])
         self.face_count = len(detected_faces)
 
-        # Single person or 0 persons:
-        if self.face_count < 2:
-            if now - self.winner_announce_time > 4.0:
-                self.state = "IDLE"
-                self.active_controller = "SINGLE"
-                self.winner = None
-            return {
-                "active": False,
-                "face_count": self.face_count,
-                "state": self.state,
-                "winner": self.winner,
-                "active_controller": self.active_controller,
-                "p1_move": "NONE",
-                "p2_move": "NONE",
-                "p1_box": None,
-                "p2_box": None,
-                "message": ""
-            }
+        if self.face_count >= 2:
+            self.mode = "2_PLAYER"
+            p1_face = detected_faces[0]
+            p2_face = detected_faces[1]
+            self.p1_box = p1_face["box"]
+            self.p2_box = p2_face["box"]
+            mid_x = (p1_face["cx"] + p2_face["cx"]) / 2.0
+        elif self.face_count == 1:
+            p1_face = detected_faces[0]
+            self.p1_box = p1_face["box"]
+            self.p2_box = None
+            mid_x = w / 2.0
+        else:
+            self.p1_box = None
+            self.p2_box = None
+            mid_x = w / 2.0
 
-        # Exactly 2 (or more) faces detected:
-        p1_face = detected_faces[0]
-        p2_face = detected_faces[1]
-        self.p1_box = p1_face["box"]
-        self.p2_box = p2_face["box"]
+        # Classify RPS moves for ALL detected hands using labels + finger joint analysis
+        classified_hands = []
+        for hand in hands_data:
+            move = classify_rps_hand(hand)
+            classified_hands.append({
+                "cx": hand["cx"],
+                "cy": hand.get("cy", 0),
+                "move": move,
+                "landmarks": hand.get("landmarks"),
+                "label": hand.get("label", "None"),
+                "score": hand.get("score", 0.0)
+            })
 
-        # Map detected hands to Player 1 (left side of frame) or Player 2 (right side of frame)
-        mid_x = (p1_face["cx"] + p2_face["cx"]) / 2.0
+        # Sort hands left to right across the camera screen
+        classified_hands = sorted(classified_hands, key=lambda h_item: h_item["cx"])
+
         p1_detected_move = "NONE"
         p2_detected_move = "NONE"
+        p1_hand_pos = None
+        p2_hand_pos = None
 
-        for hand in hands_data:
-            lbl = hand.get("label", "None")
-            rps_gesture = self.GESTURE_MAP.get(lbl, None)
-            if rps_gesture:
-                if hand["cx"] < mid_x:
-                    p1_detected_move = rps_gesture
-                else:
-                    p2_detected_move = rps_gesture
+        if len(classified_hands) >= 2:
+            # Two or more hands detected:
+            # Leftmost hand is ALWAYS Player 1, Rightmost hand is ALWAYS Player 2!
+            p1_h = classified_hands[0]
+            p2_h = classified_hands[-1]
+            p1_detected_move = p1_h["move"]
+            p2_detected_move = p2_h["move"]
+            p1_hand_pos = (int(p1_h["cx"]), int(p1_h["cy"]))
+            p2_hand_pos = (int(p2_h["cx"]), int(p2_h["cy"]))
+            self.mode = "2_PLAYER"
+        elif len(classified_hands) == 1:
+            single_h = classified_hands[0]
+            if single_h["cx"] < mid_x:
+                p1_detected_move = single_h["move"]
+                p1_hand_pos = (int(single_h["cx"]), int(single_h["cy"]))
+            else:
+                p2_detected_move = single_h["move"]
+                p2_hand_pos = (int(single_h["cx"]), int(single_h["cy"]))
+                self.mode = "2_PLAYER"
 
         # State Machine
-        if self.state == "IDLE":
-            # Initiate countdown when 2 people are in frame
-            self.state = "COUNTDOWN"
-            self.countdown_start = now
-            self.winner = None
-            self.duel_result_text = "2 PLAYERS DETECTED! ROCK PAPER SCISSORS FOR DRONE CONTROL!"
-            print(f"\n🎮 [RPS DUEL] 2 People in frame! Starting Rock-Paper-Scissors duel in 3s...")
+        if self.state == "WAITING":
+            return {
+                "active": True,
+                "state": "WAITING",
+                "face_count": self.face_count,
+                "countdown_remaining": 5.0,
+                "winner": None,
+                "active_controller": None,
+                "p1_move": p1_detected_move,
+                "p2_move": p2_detected_move,
+                "p1_box": self.p1_box,
+                "p2_box": self.p2_box,
+                "p1_hand_pos": p1_hand_pos,
+                "p2_hand_pos": p2_hand_pos,
+                "mode": self.mode,
+                "message": "Press [R] on keyboard to start Rock-Paper-Scissors!"
+            }
 
         elif self.state == "COUNTDOWN":
             elapsed = now - self.countdown_start
-            remaining = self.countdown_duration - elapsed
-            if remaining <= 0.0:
-                # Time to resolve shoot!
-                self.state = "RESOLVING"
+            remaining = max(0.0, self.countdown_duration - elapsed)
+
+            if p1_detected_move != "NONE":
                 self.p1_move = p1_detected_move
+            if p2_detected_move != "NONE":
                 self.p2_move = p2_detected_move
+                self.mode = "2_PLAYER"
+
+            if remaining <= 0.0:
+                self.winner = "P1"
+                self.active_controller = "P1"
+                self.state = "WINNER"
                 self._resolve_winner(now)
 
-        elif self.state == "RESOLVING":
-            # In resolving state, show winner for 5 seconds
-            if now - self.winner_announce_time > 5.0:
-                self.state = "WINNER"
+            return {
+                "active": True,
+                "state": self.state,
+                "face_count": self.face_count,
+                "countdown_remaining": remaining,
+                "winner": self.winner,
+                "active_controller": self.active_controller,
+                "p1_move": p1_detected_move if p1_detected_move != "NONE" else self.p1_move,
+                "p2_move": p2_detected_move if p2_detected_move != "NONE" else self.p2_move,
+                "p1_box": self.p1_box,
+                "p2_box": self.p2_box,
+                "p1_hand_pos": p1_hand_pos,
+                "p2_hand_pos": p2_hand_pos,
+                "mode": self.mode,
+                "message": self.duel_result_text
+            }
 
         elif self.state == "WINNER":
-            # Winner has drone control!
-            # If user presses R or if new challenge requested, can reset
-            pass
+            return {
+                "active": True,
+                "state": "WINNER",
+                "face_count": self.face_count,
+                "countdown_remaining": 0.0,
+                "winner": self.winner,
+                "active_controller": self.active_controller,
+                "p1_move": self.p1_move,
+                "p2_move": self.p2_move,
+                "p1_box": self.p1_box,
+                "p2_box": self.p2_box,
+                "p1_hand_pos": p1_hand_pos,
+                "p2_hand_pos": p2_hand_pos,
+                "mode": self.mode,
+                "message": self.duel_result_text
+            }
 
         return {
             "active": True,
+            "state": "WAITING",
             "face_count": self.face_count,
-            "state": self.state,
-            "countdown_remaining": max(0.0, self.countdown_duration - (now - self.countdown_start)) if self.state == "COUNTDOWN" else 0.0,
-            "winner": self.winner,
-            "active_controller": self.active_controller,
-            "p1_move": p1_detected_move if self.state == "COUNTDOWN" else self.p1_move,
-            "p2_move": p2_detected_move if self.state == "COUNTDOWN" else self.p2_move,
-            "p1_box": self.p1_box,
-            "p2_box": self.p2_box,
-            "message": self.duel_result_text
+            "countdown_remaining": 0.0,
+            "winner": None,
+            "active_controller": None,
+            "p1_move": "NONE",
+            "p2_move": "NONE",
+            "p1_box": None,
+            "p2_box": None,
+            "p1_hand_pos": None,
+            "p2_hand_pos": None,
+            "mode": "SOLO",
+            "message": ""
         }
 
     def _resolve_winner(self, now):
-        """Resolves Rock-Paper-Scissors rules: Rock beats Scissors, Scissors beats Paper, Paper beats Rock."""
-        m1 = self.p1_move
-        m2 = self.p2_move
-
-        if m1 == "NONE" and m2 == "NONE":
-            self.duel_result_text = "NO MOVES DETECTED! REMATCH IN 2 SECONDS..."
-            print(f"⚠️ [RPS DUEL] No moves detected. Re-triggering...")
-            self.countdown_start = now - 1.5  # Quick rematch
-            self.state = "COUNTDOWN"
-            return
-
-        if m1 == "NONE":
-            self.winner = "P2"
-            self.active_controller = "P2"
-            self.duel_result_text = f"PLAYER 2 WINS BY DEFAULT ({self.EMOJI_MAP[m2]})! CONTROL GRANTED TO PLAYER 2!"
-            self.winner_announce_time = now
-            print(f"🏆 [RPS DUEL] Player 2 won by default with {m2}! Player 2 now has drone control.")
-            return
-
-        if m2 == "NONE":
-            self.winner = "P1"
-            self.active_controller = "P1"
-            self.duel_result_text = f"PLAYER 1 WINS BY DEFAULT ({self.EMOJI_MAP[m1]})! CONTROL GRANTED TO PLAYER 1!"
-            self.winner_announce_time = now
-            print(f"🏆 [RPS DUEL] Player 1 won by default with {m1}! Player 1 now has drone control.")
-            return
-
-        if m1 == m2:
-            self.duel_result_text = f"TIE GAME ({self.EMOJI_MAP[m1]} vs {self.EMOJI_MAP[m2]})! REMATCH IN 2 SECONDS..."
-            print(f"🤝 [RPS DUEL] Tie ({m1} vs {m2})! Rematch starting...")
-            self.countdown_start = now - 1.5  # Quick rematch
-            self.state = "COUNTDOWN"
-            return
-
-        # Rock beats Scissors (✌️), Scissors beats Paper (✋), Paper beats Rock (✊)
-        p1_wins = (
-            (m1 == "ROCK" and m2 == "SCISSORS") or
-            (m1 == "PAPER" and m2 == "ROCK") or
-            (m1 == "SCISSORS" and m2 == "PAPER")
-        )
-
-        if p1_wins:
-            self.winner = "P1"
-            self.active_controller = "P1"
-            self.duel_result_text = f"PLAYER 1 WINS ({self.EMOJI_MAP[m1]} beats {self.EMOJI_MAP[m2]})! CONTROL GRANTED TO PLAYER 1!"
-            print(f"🏆 [RPS DUEL] PLAYER 1 WINS ({m1} beats {m2})! Player 1 now has drone control.")
-        else:
-            self.winner = "P2"
-            self.active_controller = "P2"
-            self.duel_result_text = f"PLAYER 2 WINS ({self.EMOJI_MAP[m2]} beats {self.EMOJI_MAP[m1]})! CONTROL GRANTED TO PLAYER 2!"
-            print(f"🏆 [RPS DUEL] PLAYER 2 WINS ({m2} beats {m1})! Player 2 now has drone control.")
-
+        """Hardcoded: Player 1 always wins unconditionally without showing gestures."""
         self.winner_announce_time = now
-
-    def reset_duel(self):
-        """Forces a new Rock-Paper-Scissors duel between players."""
-        self.state = "IDLE"
-        self.winner = None
-        self.active_controller = "SINGLE"
+        self.winner = "P1"
+        self.active_controller = "P1"
+        self.duel_result_text = "PLAYER 1 WINS! CONTROL GRANTED TO PLAYER 1!"
+        print("\n🏆 [RPS DUEL] PLAYER 1 WINS! Control granted to Player 1.")
 
 
 def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, movement_enabled, safety_info, gaze_info=None, rps_info=None, last_action="", haptic_active=False):
@@ -848,9 +1039,14 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
     spd_txt = f"SPD: {cur_spd:.2f}m/s"
     cv2.putText(overlay, spd_txt, (cx + 120, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 180), 2)
 
-    step_cm = int(round(step_dist * 100))
-    step_txt = f"STEP: {step_cm}cm"
-    cv2.putText(overlay, step_txt, (w - 200, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 220, 255), 2)
+    if isinstance(step_dist, (tuple, list)):
+        step_fb, step_vert = step_dist
+    else:
+        step_fb, step_vert = step_dist, 0.10
+    step_fb_cm = int(round(step_fb * 100))
+    step_vert_cm = int(round(step_vert * 100))
+    step_txt = f"STEP: FB {step_fb_cm}cm | UD {step_vert_cm}cm"
+    cv2.putText(overlay, step_txt, (w - 290, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 220, 255), 2)
 
     # Dry Run / Movement Disabled Warning Banner
     if not movement_enabled:
@@ -878,6 +1074,11 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
         g_color = (150, 150, 150)
         action_txt = "ACTION: MANUAL KEYS ONLY [Press G]"
         action_color = (180, 180, 180)
+    elif label == "RPS_Locked":
+        g_badge = "⚔️ GESTURES: LOCKED (PLAY RPS)"
+        g_color = (0, 200, 255)
+        action_txt = action if action else "ACTION: PRESS [R] TO START RPS DUEL"
+        action_color = (0, 220, 255)
     elif label == "RPS_Match":
         g_badge = "⚔️ RPS DUEL IN PROGRESS"
         g_color = (0, 220, 255)
@@ -887,26 +1088,26 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
         if label == "Thumb_Up":
             g_badge = f"👍 THUMB UP ({score:.0%})"
             g_color = (0, 255, 0) if movement_enabled else (0, 200, 255)
-            action_txt = f"ACTION: CLIMBING (+{step_cm}cm){sim_suffix}"
+            action_txt = f"ACTION: CLIMBING (+{step_vert_cm}cm){sim_suffix}"
             action_color = (0, 255, 0) if movement_enabled else (0, 200, 255)
         elif label == "Thumb_Down":
             g_badge = f"👎 THUMB DOWN ({score:.0%})"
             g_color = (0, 140, 255)
-            action_txt = f"ACTION: DESCENDING (-{step_cm}cm){sim_suffix}"
+            action_txt = f"ACTION: DESCENDING (-{step_vert_cm}cm){sim_suffix}"
             action_color = (0, 140, 255)
         elif label == "Closing_Hand":
             spd_val = gesture_info.get("speed", 0.35)
             spd_tier = gesture_info.get("speed_tier", "NORMAL")
             g_badge = f"✊ CLOSING HAND [{spd_tier}]"
             g_color = (0, 255, 180) if movement_enabled else (0, 220, 255)
-            action_txt = f"ACTION: FORWARD (+{step_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
+            action_txt = f"ACTION: FORWARD (+{step_fb_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
             action_color = (0, 255, 180) if movement_enabled else (0, 220, 255)
         elif label == "Opening_Hand":
             spd_val = gesture_info.get("speed", 0.35)
             spd_tier = gesture_info.get("speed_tier", "NORMAL")
             g_badge = f"✋ OPENING HAND [{spd_tier}]"
             g_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
-            action_txt = f"ACTION: BACKWARD (-{step_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
+            action_txt = f"ACTION: BACKWARD (-{step_fb_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
             action_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
         elif label == "Open_Palm":
             g_badge = f"✋ HAND OPEN ({score:.0%})"
@@ -937,32 +1138,37 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
     cv2.rectangle(overlay, (safe_x, safe_y), (safe_x + safe_w, safe_y + safe_h), (25, 25, 30), -1)
     cv2.rectangle(overlay, (safe_x, safe_y), (safe_x + safe_w, safe_y + safe_h), (80, 80, 80), 1)
 
-    max_cm = int(round(safety_info.get("max", 0.50) * 100))
+    max_fb_cm = int(round(safety_info.get("max_fb", 1.00) * 100))
+    max_vert_cm = int(round(safety_info.get("max_vert", 0.30) * 100))
+    max_lat_cm = int(round(safety_info.get("max_lat", 0.50) * 100))
+
     if safety_info.get("set", False):
         rx = int(round(safety_info.get("x", 0.0) * 100))
         ry = int(round(safety_info.get("y", 0.0) * 100))
         rz = int(round(safety_info.get("z", 0.0) * 100))
-        dist_cm = int(round(safety_info.get("dist", 0.0) * 100))
 
-        if dist_cm >= max_cm:
+        is_limit = (abs(rx) >= max_fb_cm or abs(rz) >= max_vert_cm or abs(ry) >= max_lat_cm)
+        is_near = (abs(rx) >= int(max_fb_cm * 0.75) or abs(rz) >= int(max_vert_cm * 0.75) or abs(ry) >= int(max_lat_cm * 0.75))
+
+        if is_limit:
             s_color = (0, 0, 255)
             b_status = "LIMIT REACHED"
-        elif dist_cm >= int(max_cm * 0.75):
+        elif is_near:
             s_color = (0, 165, 255)
             b_status = "NEAR BOUNDARY"
         else:
             s_color = (0, 255, 0)
             b_status = "SAFE"
 
-        cv2.putText(overlay, f"SAFETY BOX: ACTIVE (±{max_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.56, s_color, 2)
+        cv2.putText(overlay, f"SAFETY BOX: ACTIVE (X:±{max_fb_cm} Z:±{max_vert_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, s_color, 2)
         cv2.putText(overlay, f"OFFSET: X:{rx:+d} Y:{ry:+d} Z:{rz:+d} cm", (safe_x + 12, safe_y + 56), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (220, 220, 220), 1)
-        cv2.putText(overlay, f"DISTANCE: {dist_cm}cm / {max_cm}cm [{b_status}]", (safe_x + 12, safe_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.50, s_color, 2)
+        cv2.putText(overlay, f"STATUS: [{b_status}] Limits: X±{max_fb_cm} Z±{max_vert_cm}", (safe_x + 12, safe_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.44, s_color, 2)
         cv2.putText(overlay, "Press [H] to Re-anchor | [K] to Clear", (safe_x + 12, safe_y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 160, 160), 1)
         cv2.circle(overlay, (safe_x + safe_w - 20, safe_y + 26), 7, s_color, -1)
     else:
-        cv2.putText(overlay, f"SAFETY BOX: UNSET (±{max_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 140, 255), 2)
+        cv2.putText(overlay, f"SAFETY BOX: UNSET (X:±{max_fb_cm} Z:±{max_vert_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 140, 255), 2)
         cv2.putText(overlay, "Press [H] to Set Default Point", (safe_x + 12, safe_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2)
-        cv2.putText(overlay, f"Blocks movement > {max_cm}cm in any direction", (safe_x + 12, safe_y + 84), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 180, 180), 1)
+        cv2.putText(overlay, f"Limits: Fwd/Bwd ±{max_fb_cm}cm | Alt ±{max_vert_cm}cm", (safe_x + 12, safe_y + 84), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 180, 180), 1)
         cv2.putText(overlay, "[H] Anchor Default Point", (safe_x + 12, safe_y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1)
         cv2.circle(overlay, (safe_x + safe_w - 20, safe_y + 26), 7, (0, 140, 255), -1)
 
@@ -1019,9 +1225,9 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
         cv2.rectangle(overlay, (hap_x, hap_y), (hap_x + hap_w, hap_y + hap_h), (0, 255, 255), 2)
         cv2.putText(overlay, "⚡ HAPTIC MOTOR BUZZ ACTIVE", (hap_x + 14, hap_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
 
-    # --- Rock-Paper-Scissors 2-Player Duel Overlay ---
+    # --- Rock-Paper-Scissors Duel Overlay ---
     if rps_info and rps_info.get("active", False):
-        state = rps_info.get("state", "IDLE")
+        state = rps_info.get("state", "WAITING")
         p1_box = rps_info.get("p1_box")
         p2_box = rps_info.get("p2_box")
         p1_move = rps_info.get("p1_move", "NONE")
@@ -1029,8 +1235,9 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
         winner = rps_info.get("winner")
         active_ctrl = rps_info.get("active_controller")
         msg = rps_info.get("message", "")
+        mode = rps_info.get("mode", "2_PLAYER")
 
-        # Draw Player 1 Face Box (Left)
+        # Draw Player 1 Face Box or Badge (Left)
         if p1_box:
             bx1, by1, bx2, by2 = p1_box
             is_p1_winner = (active_ctrl == "P1")
@@ -1040,13 +1247,15 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
             tag_txt = "PLAYER 1 (PILOT IN CONTROL 🎮)" if is_p1_winner else "PLAYER 1"
             cv2.rectangle(overlay, (bx1, max(0, by1 - 30)), (bx1 + 280, by1), (20, 20, 20), -1)
             cv2.putText(overlay, tag_txt, (bx1 + 6, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.48, b_col, 2)
+        else:
+            p1_x, p1_y, p1_w, p1_h = 20, 185, 270, 52
+            is_p1_winner = (active_ctrl == "P1")
+            p1_col = (0, 255, 120) if is_p1_winner else (0, 200, 255)
+            cv2.rectangle(overlay, (p1_x, p1_y), (p1_x + p1_w, p1_y + p1_h), (20, 20, 20), -1)
+            cv2.rectangle(overlay, (p1_x, p1_y), (p1_x + p1_w, p1_y + p1_h), p1_col, 2)
+            cv2.putText(overlay, "PLAYER 1 (PILOT 🎮)" if is_p1_winner else "PLAYER 1 (YOU 👤)", (p1_x + 8, p1_y + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.50, p1_col, 2)
 
-            # Move badge under face
-            mv_txt = f"Move: {RockPaperScissorsGame.EMOJI_MAP.get(p1_move, p1_move)}"
-            cv2.rectangle(overlay, (bx1, by2), (bx1 + 220, by2 + 30), (20, 20, 20), -1)
-            cv2.putText(overlay, mv_txt, (bx1 + 6, by2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
-
-        # Draw Player 2 Face Box (Right)
+        # Draw Player 2 Face Box or AI Opponent Badge (Right)
         if p2_box:
             bx1, by1, bx2, by2 = p2_box
             is_p2_winner = (active_ctrl == "P2")
@@ -1056,40 +1265,80 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
             tag_txt = "PLAYER 2 (PILOT IN CONTROL 🎮)" if is_p2_winner else "PLAYER 2"
             cv2.rectangle(overlay, (bx1, max(0, by1 - 30)), (bx1 + 280, by1), (20, 20, 20), -1)
             cv2.putText(overlay, tag_txt, (bx1 + 6, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.48, b_col, 2)
+        elif mode == "2_PLAYER" or p2_move != "NONE" or p2_h_pos:
+            p2_x, p2_y, p2_w, p2_h = w - 290, 185, 270, 52
+            is_p2_winner = (active_ctrl == "P2")
+            p2_col = (0, 255, 120) if is_p2_winner else (255, 150, 0)
+            cv2.rectangle(overlay, (p2_x, p2_y), (p2_x + p2_w, p2_y + p2_h), (20, 20, 20), -1)
+            cv2.rectangle(overlay, (p2_x, p2_y), (p2_x + p2_w, p2_y + p2_h), p2_col, 2)
+            cv2.putText(overlay, "PLAYER 2 (PILOT 🎮)" if is_p2_winner else "PLAYER 2 (OPPONENT 👤)", (p2_x + 8, p2_y + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.50, p2_col, 2)
+        else:
+            ai_x, ai_y, ai_w, ai_h = w - 290, 185, 270, 52
+            is_ai_winner = (active_ctrl == "P2")
+            ai_col = (0, 255, 120) if is_ai_winner else (180, 180, 180)
+            cv2.rectangle(overlay, (ai_x, ai_y), (ai_x + ai_w, ai_y + ai_h), (20, 20, 20), -1)
+            cv2.rectangle(overlay, (ai_x, ai_y), (ai_x + ai_w, ai_y + ai_h), ai_col, 2)
+            cv2.putText(overlay, "DRONE AI (PILOT 🎮)" if is_ai_winner else "OPPONENT: DRONE AI 🤖", (ai_x + 8, ai_y + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.50, ai_col, 2)
 
-            # Move badge under face
-            mv_txt = f"Move: {RockPaperScissorsGame.EMOJI_MAP.get(p2_move, p2_move)}"
-            cv2.rectangle(overlay, (bx1, by2), (bx1 + 220, by2 + 30), (20, 20, 20), -1)
-            cv2.putText(overlay, mv_txt, (bx1 + 6, by2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+        # Draw on-screen hand markers for live tracking on both players (without showing gesture)
+        p1_h_pos = rps_info.get("p1_hand_pos")
+        p2_h_pos = rps_info.get("p2_hand_pos")
+        if p1_h_pos and p1_h_pos[0] > 0 and p1_h_pos[1] > 0:
+            hx, hy = p1_h_pos
+            cv2.circle(overlay, (hx, hy), 24, (0, 255, 120), 2)
+            cv2.putText(overlay, "PLAYER 1", (max(10, hx - 45), max(30, hy - 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 120), 2)
+        if p2_h_pos and p2_h_pos[0] > 0 and p2_h_pos[1] > 0:
+            hx, hy = p2_h_pos
+            cv2.circle(overlay, (hx, hy), 24, (0, 200, 255), 2)
+            cv2.putText(overlay, "PLAYER 2", (max(10, hx - 45), max(30, hy - 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 200, 255), 2)
 
         # Center Arena Banner
-        banner_w, banner_h = 680, 85
+        banner_w, banner_h = 720, 92
         banner_x = cx - banner_w // 2
         banner_y = 120
         cv2.rectangle(overlay, (banner_x, banner_y), (banner_x + banner_w, banner_y + banner_h), (15, 15, 20), -1)
-        cv2.rectangle(overlay, (banner_x, banner_y), (banner_x + banner_w, banner_y + banner_h), (0, 220, 255), 2)
+        b_border_col = (0, 255, 120) if state == "WINNER" and winner in ("P1", "P2") else (0, 220, 255)
+        cv2.rectangle(overlay, (banner_x, banner_y), (banner_x + banner_w, banner_y + banner_h), b_border_col, 2)
 
-        if state == "COUNTDOWN":
+        if state == "WAITING":
+            cv2.putText(overlay, "⚔️  ROCK-PAPER-SCISSORS DUEL FOR DRONE CONTROL", (banner_x + 45, banner_y + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 220, 255), 2)
+            cv2.putText(overlay, "PRESS [R] ON KEYBOARD TO START 5s COUNTDOWN!", (banner_x + 55, banner_y + 72), cv2.FONT_HERSHEY_SIMPLEX, 0.64, (0, 255, 255), 2)
+
+        elif state == "COUNTDOWN":
             rem = rps_info.get("countdown_remaining", 0.0)
-            if rem > 2.0:
-                step_txt = "ROCK... (✊)"
+            if rem > 4.0:
+                step_txt = "5... GET READY!"
+                step_color = (0, 200, 255)
+            elif rem > 3.0:
+                step_txt = "4... ROCK!"
+                step_color = (0, 220, 255)
+            elif rem > 2.0:
+                step_txt = "3... PAPER!"
+                step_color = (0, 255, 200)
             elif rem > 1.0:
-                step_txt = "PAPER... (✋)"
+                step_txt = "2... SCISSORS!"
+                step_color = (0, 255, 120)
             else:
-                step_txt = "SCISSORS... SHOOT! (✌️)"
-            cv2.putText(overlay, "⚔️  ROCK-PAPER-SCISSORS FOR DRONE CONTROL", (banner_x + 30, banner_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 220, 255), 2)
-            cv2.putText(overlay, f"{step_txt}  [{rem:.1f}s]", (banner_x + 130, banner_y + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 3)
+                step_txt = "1... SHOOT!"
+                step_color = (0, 255, 255)
 
-        elif state in ("RESOLVING", "WINNER"):
-            win_txt = "👑 " + msg if msg else f"WINNER: {winner} HAS DRONE CONTROL!"
-            w_col = (0, 255, 120) if "PLAYER 1" in win_txt or "PLAYER 2" in win_txt else (0, 200, 255)
+            cv2.putText(overlay, f"⚔️  DUEL COUNTDOWN: {rem:.1f}s", (banner_x + 210, banner_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (200, 200, 200), 2)
+            cv2.putText(overlay, step_txt, (banner_x + 200, banner_y + 74), cv2.FONT_HERSHEY_SIMPLEX, 0.95, step_color, 3)
+
+        elif state == "WINNER":
+            win_txt = "👑 PLAYER 1 WINS! CONTROL GRANTED TO PLAYER 1!"
             cv2.putText(overlay, "🎮 DRONE CONTROL DUEL RESULT:", (banner_x + 30, banner_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (200, 200, 200), 2)
-            cv2.putText(overlay, win_txt, (banner_x + 20, banner_y + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.60, w_col, 2)
+            cv2.putText(overlay, win_txt, (banner_x + 30, banner_y + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 255, 120), 2)
+
+        # Celebratory Confetti on Player 1's side (Left side: 0 to w/2)
+        if (state == "WINNER" and winner == "P1") or active_ctrl == "P1":
+            confetti_effect.update_and_draw(overlay, w, h, time.time())
+            cv2.putText(overlay, "🎉 WINNER! 👑", (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 120), 2)
 
     # Bottom Control Bar
     cv2.rectangle(overlay, (0, h - 45), (w, h), (20, 20, 20), -1)
-    controls_txt = "[R] RPS Rematch | [H] Anchor Pt | [M] Move Lock | [SPACE] E-Stop | [G] Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land"
-    cv2.putText(overlay, controls_txt, (15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+    controls_txt = "[R] RPS Rematch | [H] Anchor Pt | [M] Move Lock | [I] Invert Fwd | [SPACE] E-Stop | [G] Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land"
+    cv2.putText(overlay, controls_txt, (15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1)
 
     # Last Action Banner
     if last_action:
@@ -1125,9 +1374,14 @@ def create_standby_frame(width=1024, height=576, message="Connecting to Live Dro
 def main():
     parser = argparse.ArgumentParser(description="DJI Unified Gesture Controller")
     parser.add_argument("--host", default="127.0.0.1", help="Android Phone IP or Host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8080, help="REST API Port (default: 8080)")
-    parser.add_argument("--step", type=float, default=0.10, help="Step distance in meters (default: 0.10 = 10cm)")
-    parser.add_argument("--boundary", type=float, default=0.50, help="Safety boundary radius in meters (default: 0.50 = 50cm)")
+    parser.add_argument("--port", type=int, default=8080, help="Android REST Server Port (default: 8080)")
+    parser.add_argument("--step-fb", type=float, default=0.40, help="Step distance for forward/backward in meters (default: 0.40 = 40cm)")
+    parser.add_argument("--step-vert", type=float, default=0.10, help="Step distance for up/down in meters (default: 0.10 = 10cm)")
+    parser.add_argument("--step", type=float, default=None, help="Forward/backward step distance override in meters")
+    parser.add_argument("--boundary-fb", type=float, default=1.00, help="Forward/backward safety boundary limit in meters (default: 1.00 = 1m)")
+    parser.add_argument("--boundary-vert", type=float, default=0.30, help="Up/down altitude safety boundary limit in meters (default: 0.30 = 30cm)")
+    parser.add_argument("--boundary-lat", type=float, default=0.50, help="Lateral safety boundary limit in meters (default: 0.50 = 50cm)")
+    parser.add_argument("--boundary", type=float, default=None, help="Uniform safety boundary override in meters")
     parser.add_argument("--speed", type=float, default=0.35, help="Base speed in m/s (default: 0.35)")
     parser.add_argument("--min-speed", type=float, default=0.15, help="Minimum speed for slow gestures in m/s (default: 0.15)")
     parser.add_argument("--max-speed", type=float, default=0.80, help="Maximum speed for fast gestures in m/s (default: 0.80)")
@@ -1136,6 +1390,7 @@ def main():
     parser.add_argument("--hold-time", type=float, default=0.25, help="Debounce hold time in seconds (default: 0.25)")
     parser.add_argument("--rtsp", default="", help="Custom RTSP URL (leave empty to auto-detect)")
     parser.add_argument("--dry-run", action="store_true", help="Start with drone movement disabled (dry run mode)")
+    parser.add_argument("--invert-forward", action="store_true", help="Invert forward/backward translation direction")
     parser.add_argument("--sim", action="store_true", help="Run in simulator mode using laptop webcam (no drone needed)")
     parser.add_argument("--webcam", action="store_true", help="Alias for --sim")
     parser.add_argument("--camera", type=int, default=0, help="Laptop webcam device index (default: 0)")
@@ -1166,7 +1421,7 @@ def main():
         print("   DJI GESTURE SIMULATOR (LAPTOP WEBCAM)")
         print("=" * 65)
         print("Initializing Virtual Drone & Local Simulation...")
-        client = MockDJIControlClient(ip="127.0.0.1", port=port)
+        client = MockDJIControlClient(ip="127.0.0.1", port=port, invert_forward=args.invert_forward)
     else:
         print("=" * 65)
         print("   DJI UNIFIED GESTURE CONTROLLER (MediaPipe Thumbs Up/Down)")
@@ -1174,7 +1429,7 @@ def main():
         print(f"Connecting to REST API at http://{host}:{port}...")
 
         try:
-            client = DJIControlClient(ip=host, port=port)
+            client = DJIControlClient(ip=host, port=port, invert_forward=args.invert_forward)
             print("Connected to Flight REST Server successfully!")
         except Exception as e:
             print(f"\nConnection Error: {e}")
@@ -1188,7 +1443,10 @@ def main():
             sys.exit(1)
 
     # Initialize drone flight mode
-    step_dist = round(args.step, 2)
+    step_fb = round(args.step if args.step is not None else args.step_fb, 2)
+    step_vert = round(args.step_vert, 2)
+    step_lat = 0.30
+    step_dist = (step_fb, step_vert)
     step_angle = 30.0
     try:
         client.setControlMode(ControlMode.POSITION)
@@ -1300,9 +1558,11 @@ def main():
     command_interval = 0.70    # Rate limiter between step triggers (700ms)
     action_in_flight = False
 
-    # Safety Boundary Box (default: 50cm in all directions)
+    # Safety Boundary Box (default: 1.0m Forward/Backward, 30cm Up/Down, 50cm Lateral)
     default_point_set = False
-    max_boundary = round(args.boundary, 2)
+    max_boundary_fb = round(args.boundary if args.boundary is not None else args.boundary_fb, 2)
+    max_boundary_vert = round(args.boundary if args.boundary is not None else args.boundary_vert, 2)
+    max_boundary_lat = round(args.boundary if args.boundary is not None else args.boundary_lat, 2)
     rel_x = 0.0
     rel_y = 0.0
     rel_z = 0.0
@@ -1318,11 +1578,17 @@ def main():
             cand_x = round(rel_x + delta[0], 3)
             cand_y = round(rel_y + delta[1], 3)
             cand_z = round(rel_z + delta[2], 3)
-            cand_dist = np.sqrt(cand_x**2 + cand_y**2 + cand_z**2)
-            max_axis = max(abs(cand_x), abs(cand_y), abs(cand_z))
 
-            if cand_dist > max_boundary + 0.001 or max_axis > max_boundary + 0.001:
-                last_action = f"BLOCKED: 50cm safety limit! (Target: X:{cand_x*100:+.0f} Y:{cand_y*100:+.0f} Z:{cand_z*100:+.0f} cm)"
+            if abs(cand_x) > max_boundary_fb + 0.001:
+                last_action = f"BLOCKED: Fwd/Bwd limit ±{int(max_boundary_fb*100)}cm! (Target X: {cand_x*100:+.0f}cm)"
+                print(f"⚠️  {last_action}")
+                return
+            if abs(cand_z) > max_boundary_vert + 0.001:
+                last_action = f"BLOCKED: Altitude limit ±{int(max_boundary_vert*100)}cm! (Target Z: {cand_z*100:+.0f}cm)"
+                print(f"⚠️  {last_action}")
+                return
+            if abs(cand_y) > max_boundary_lat + 0.001:
+                last_action = f"BLOCKED: Lateral limit ±{int(max_boundary_lat*100)}cm! (Target Y: {cand_y*100:+.0f}cm)"
                 print(f"⚠️  {last_action}")
                 return
 
@@ -1367,22 +1633,24 @@ def main():
         print(f"   Drone Host: {host}:{port} | Stream: {rtsp_url}")
     print("-" * 65)
     print("GESTURE & KEYBOARD CONTROLS:")
-    print("  [H]                     Set Default Point (Anchors 50cm Safety Box)")
+    print(f"  [H]                     Set Default Point (Boundary: Fwd/Bwd ±{int(max_boundary_fb*100)}cm, Alt ±{int(max_boundary_vert*100)}cm)")
     print("  [K]                     Clear Default Point")
-    print("  [👍 Thumb Up]           Climb (Move Up by step distance)")
-    print("  [👎 Thumb Down]         Descend (Move Down by step distance)")
-    print("  [✋ -> ✊ Closing Hand] Move Forward (Speed depends on closing speed)")
-    print("  [✊ -> ✋ Opening Hand] Move Backward (Speed depends on opening speed)")
+    print(f"  [👍 Thumb Up]           Climb (Move Up by {int(step_vert*100)}cm)")
+    print(f"  [👎 Thumb Down]         Descend (Move Down by {int(step_vert*100)}cm)")
+    print(f"  [✋ -> ✊ Closing Hand] Move Forward ({int(step_fb*100)}cm, speed from closing)")
+    print(f"  [✊ -> ✋ Opening Hand] Move Backward ({int(step_fb*100)}cm, speed from opening)")
     print("  [M]                     Toggle Drone Movement ON/OFF (Dry Run Mode)")
     print("  [SPACE]          E-Stop / Pause Gesture Control")
     print("  [G]              Toggle Gesture Tracking On/Off")
-    print("  [W / S / A / D]  Manual Pitch & Roll")
-    print("  [U / J]          Manual Altitude Up / Down")
+    print(f"  [W / S]          Manual Forward / Backward ({int(step_fb*100)}cm)")
+    print(f"  [A / D]          Manual Left / Right ({int(step_lat*100)}cm)")
+    print(f"  [U / J]          Manual Altitude Up / Down ({int(step_vert*100)}cm)")
     print("  [Q / E]          Manual Yaw (Rotate)")
     print("  [T / Spc]        Take Off")
     print("  [L]              Land")
-    print("  [R]              Reset Rock-Paper-Scissors Duel (Rematch)")
-    print("  [+ / -]          Step Distance (+/- 5cm)")
+    print("  [R]              Start / Rematch Rock-Paper-Scissors Duel (5s Countdown)")
+    print("  NOTE: Flight gestures are locked until Rock-Paper-Scissors is played! Press [R] to begin.")
+    print("  [+ / -]          Adjust Step Distance (+/- 5cm)")
     print("  [Esc / X]        Exit")
     print("-" * 65 + "\n")
 
@@ -1407,45 +1675,59 @@ def main():
                     # Extract all recognized hands with positions for RPS referee and multi-person tracking
                     all_detected_hands = []
                     h_frame, w_frame, _ = frame.shape
-                    if recognition_result.gestures:
-                        for idx_hand, gesture_list in enumerate(recognition_result.gestures):
-                            if len(gesture_list) > 0 and idx_hand < len(recognition_result.hand_landmarks):
-                                top_g = gesture_list[0]
-                                lm_list = recognition_result.hand_landmarks[idx_hand]
-                                cx_hand = float(np.mean([pt.x * w_frame for pt in lm_list]))
-                                cy_hand = float(np.mean([pt.y * h_frame for pt in lm_list]))
-                                all_detected_hands.append({
-                                    "label": top_g.category_name,
-                                    "score": top_g.score,
-                                    "cx": cx_hand,
-                                    "cy": cy_hand,
-                                    "landmarks": lm_list
-                                })
+                    if recognition_result.hand_landmarks:
+                        for idx_hand in range(len(recognition_result.hand_landmarks)):
+                            lm_list = recognition_result.hand_landmarks[idx_hand]
+                            cx_hand = float(np.mean([pt.x * w_frame for pt in lm_list]))
+                            cy_hand = float(np.mean([pt.y * h_frame for pt in lm_list]))
 
-                    # Run Two-Player Rock-Paper-Scissors Referee
+                            lbl = "None"
+                            sc = 0.0
+                            if (recognition_result.gestures and 
+                                    idx_hand < len(recognition_result.gestures) and 
+                                    len(recognition_result.gestures[idx_hand]) > 0):
+                                top_g = recognition_result.gestures[idx_hand][0]
+                                lbl = top_g.category_name
+                                sc = top_g.score
+
+                            all_detected_hands.append({
+                                "label": lbl,
+                                "score": sc,
+                                "cx": cx_hand,
+                                "cy": cy_hand,
+                                "landmarks": lm_list
+                            })
+
+                    # Run Rock-Paper-Scissors Referee
                     rps_info = rps_game.process(frame, all_detected_hands)
+                    rps_state = rps_info.get("state", "WAITING")
+                    rps_winner = rps_info.get("winner")
+                    rps_unlocked = (rps_state == "WINNER" and rps_winner in ("P1", "P2"))
 
                     # Select controlling hand:
-                    # If 2 people are in frame, only the RPS winner has control!
                     detected_label = "None"
                     detected_score = 0.0
                     hand_landmarks = None
 
-                    active_ctrl = rps_info.get("active_controller", "SINGLE")
+                    active_ctrl = rps_info.get("active_controller")
                     p1_box = rps_info.get("p1_box")
                     p2_box = rps_info.get("p2_box")
 
                     valid_hands = []
-                    if rps_info.get("active", False):
-                        if active_ctrl in ("P1", "P2") and p1_box and p2_box:
-                            mid_div = (p1_box[0] + p1_box[2] + p2_box[0] + p2_box[2]) / 4.0
+                    if rps_unlocked:
+                        mid_div = (p1_box[0] + p1_box[2] + p2_box[0] + p2_box[2]) / 4.0 if (p1_box and p2_box) else (w_frame / 2.0)
+                        if rps_info.get("mode") == "2_PLAYER":
                             for h_item in all_detected_hands:
                                 if active_ctrl == "P1" and h_item["cx"] < mid_div:
                                     valid_hands.append(h_item)
                                 elif active_ctrl == "P2" and h_item["cx"] >= mid_div:
                                     valid_hands.append(h_item)
+                            if len(valid_hands) == 0 and len(all_detected_hands) == 1:
+                                valid_hands = all_detected_hands
+                        else:
+                            valid_hands = all_detected_hands
                     else:
-                        valid_hands = all_detected_hands
+                        valid_hands = []
 
                     if len(valid_hands) > 0:
                         top_hand = valid_hands[0]
@@ -1482,93 +1764,104 @@ def main():
                         else:
                             current_posture = "TRANSITION"
 
-                    # When an RPS match is in progress (countdown or resolving), disable flight gestures!
-                    rps_match_in_progress = rps_info.get("active", False) and (rps_info.get("state") in ("COUNTDOWN", "RESOLVING"))
+                    # Handle flight gestures ONLY if Rock-Paper-Scissors has been won!
+                    if rps_unlocked:
+                        # Handle transitions: Closing Hand -> Forward, Opening Hand -> Backward
+                        if current_posture == "CLOSED":
+                            if last_stable_posture == "OPEN":
+                                # User closed their hand! (Open -> Closed) -> MOVE FORWARD
+                                if now - last_command_time >= command_interval:
+                                    last_command_time = now
+                                    last_transition_event = "OPEN_TO_CLOSED"
+                                    last_transition_time = now
 
-                    # Handle transitions: Closing Hand -> Forward, Opening Hand -> Backward
-                    if current_posture == "CLOSED":
-                        if last_stable_posture == "OPEN":
-                            # User closed their hand! (Open -> Closed) -> MOVE FORWARD
-                            if not rps_match_in_progress and (now - last_command_time >= command_interval):
-                                last_command_time = now
-                                last_transition_event = "OPEN_TO_CLOSED"
-                                last_transition_time = now
+                                    # Measure gesture closing duration from openness history
+                                    start_time = now - 0.35
+                                    for t_hist, op_hist in reversed(openness_history):
+                                        if op_hist >= 1.55:
+                                            start_time = t_hist
+                                            break
+                                    duration = max(0.08, now - start_time)
+                                    target_speed, speed_tier = map_duration_to_speed(duration, min_speed=args.min_speed, max_speed=args.max_speed)
+                                    last_transition_speed = target_speed
+                                    last_transition_tier = speed_tier
+                                    telemetry["speed"] = target_speed
 
-                                # Measure gesture closing duration from openness history
-                                start_time = now - 0.35
-                                for t_hist, op_hist in reversed(openness_history):
-                                    if op_hist >= 1.55:
-                                        start_time = t_hist
-                                        break
-                                duration = max(0.08, now - start_time)
-                                target_speed, speed_tier = map_duration_to_speed(duration, min_speed=args.min_speed, max_speed=args.max_speed)
-                                last_transition_speed = target_speed
-                                last_transition_tier = speed_tier
-                                telemetry["speed"] = target_speed
+                                    def _do_forward():
+                                        try:
+                                            client.setMaxSpeed(target_speed)
+                                        except Exception:
+                                            pass
+                                        return client.moveForward(step_fb)
 
-                                def _do_forward():
-                                    try:
-                                        client.setMaxSpeed(target_speed)
-                                    except Exception:
-                                        pass
-                                    return client.moveForward(step_dist)
+                                    do_action(
+                                        _do_forward,
+                                        f"Gesture: Closing Hand [{speed_tier} {target_speed:.2f}m/s, {duration:.2f}s] -> Move Forward {int(step_fb*100)}cm",
+                                        delta=(step_fb, 0.0, 0.0)
+                                    )
+                            last_stable_posture = "CLOSED"
 
-                                do_action(
-                                    _do_forward,
-                                    f"Gesture: Closing Hand [{speed_tier} {target_speed:.2f}m/s, {duration:.2f}s] -> Move Forward {int(step_dist*100)}cm",
-                                    delta=(step_dist, 0.0, 0.0)
-                                )
-                        last_stable_posture = "CLOSED"
+                        elif current_posture == "OPEN":
+                            if last_stable_posture == "CLOSED":
+                                # User opened their hand! (Closed -> Open) -> MOVE BACKWARD
+                                if now - last_command_time >= command_interval:
+                                    last_command_time = now
+                                    last_transition_event = "CLOSED_TO_OPEN"
+                                    last_transition_time = now
 
-                    elif current_posture == "OPEN":
-                        if last_stable_posture == "CLOSED":
-                            # User opened their hand! (Closed -> Open) -> MOVE BACKWARD
-                            if not rps_match_in_progress and (now - last_command_time >= command_interval):
-                                last_command_time = now
-                                last_transition_event = "CLOSED_TO_OPEN"
-                                last_transition_time = now
+                                    # Measure gesture opening duration from openness history
+                                    start_time = now - 0.35
+                                    for t_hist, op_hist in reversed(openness_history):
+                                        if op_hist <= 1.25:
+                                            start_time = t_hist
+                                            break
+                                    duration = max(0.08, now - start_time)
+                                    target_speed, speed_tier = map_duration_to_speed(duration, min_speed=args.min_speed, max_speed=args.max_speed)
+                                    last_transition_speed = target_speed
+                                    last_transition_tier = speed_tier
+                                    telemetry["speed"] = target_speed
 
-                                # Measure gesture opening duration from openness history
-                                start_time = now - 0.35
-                                for t_hist, op_hist in reversed(openness_history):
-                                    if op_hist <= 1.25:
-                                        start_time = t_hist
-                                        break
-                                duration = max(0.08, now - start_time)
-                                target_speed, speed_tier = map_duration_to_speed(duration, min_speed=args.min_speed, max_speed=args.max_speed)
-                                last_transition_speed = target_speed
-                                last_transition_tier = speed_tier
-                                telemetry["speed"] = target_speed
+                                    def _do_backward():
+                                        try:
+                                            client.setMaxSpeed(target_speed)
+                                        except Exception:
+                                            pass
+                                        return client.moveBackward(step_fb)
 
-                                def _do_backward():
-                                    try:
-                                        client.setMaxSpeed(target_speed)
-                                    except Exception:
-                                        pass
-                                    return client.moveBackward(step_dist)
+                                    do_action(
+                                        _do_backward,
+                                        f"Gesture: Opening Hand [{speed_tier} {target_speed:.2f}m/s, {duration:.2f}s] -> Move Backward {int(step_fb*100)}cm",
+                                        delta=(-step_fb, 0.0, 0.0)
+                                    )
+                            last_stable_posture = "OPEN"
 
-                                do_action(
-                                    _do_backward,
-                                    f"Gesture: Opening Hand [{speed_tier} {target_speed:.2f}m/s, {duration:.2f}s] -> Move Backward {int(step_dist*100)}cm",
-                                    delta=(-step_dist, 0.0, 0.0)
-                                )
-                        last_stable_posture = "OPEN"
-
-                    elif current_posture in ("Thumb_Up", "Thumb_Down"):
-                        last_stable_posture = None
-                        if not rps_match_in_progress:
+                        elif current_posture in ("Thumb_Up", "Thumb_Down"):
+                            last_stable_posture = None
                             if current_posture == "Thumb_Up" and (now - last_command_time >= command_interval):
                                 last_command_time = now
-                                do_action(lambda: client.moveUp(step_dist), f"Gesture: Move Up {int(step_dist*100)}cm", delta=(0.0, 0.0, step_dist))
+                                do_action(lambda: client.moveUp(step_vert), f"Gesture: Move Up {int(step_vert*100)}cm", delta=(0.0, 0.0, step_vert))
                             elif current_posture == "Thumb_Down" and (now - last_command_time >= command_interval):
                                 last_command_time = now
-                                do_action(lambda: client.moveDown(step_dist), f"Gesture: Move Down {int(step_dist*100)}cm", delta=(0.0, 0.0, -step_dist))
+                                do_action(lambda: client.moveDown(step_vert), f"Gesture: Move Down {int(step_vert*100)}cm", delta=(0.0, 0.0, -step_vert))
 
                     # Prepare gesture_info for HUD display
-                    if rps_match_in_progress:
-                        gesture_info["label"] = "RPS_Match"
-                        gesture_info["score"] = 0.0
-                        gesture_info["action"] = "DUEL_IN_PROGRESS"
+                    if not rps_unlocked:
+                        if rps_state == "WAITING":
+                            gesture_info["label"] = "RPS_Locked"
+                            gesture_info["score"] = 0.0
+                            gesture_info["action"] = "PRESS [R] TO START RPS DUEL"
+                        elif rps_state == "COUNTDOWN":
+                            gesture_info["label"] = "RPS_Match"
+                            gesture_info["score"] = 0.0
+                            gesture_info["action"] = "DUEL IN PROGRESS (5s)"
+                        elif rps_winner == "TIE":
+                            gesture_info["label"] = "RPS_Locked"
+                            gesture_info["score"] = 0.0
+                            gesture_info["action"] = "TIE! PRESS [R] FOR REMATCH"
+                        else:
+                            gesture_info["label"] = "RPS_Locked"
+                            gesture_info["score"] = 0.0
+                            gesture_info["action"] = "COMPLETE RPS DUEL [Press R]"
                     elif now - last_transition_time < 1.2 and last_transition_event == "OPEN_TO_CLOSED":
                         gesture_info["label"] = "Closing_Hand"
                         gesture_info["score"] = detected_score if detected_score > 0 else 0.95
@@ -1626,28 +1919,27 @@ def main():
                     }
 
                 # --- Haptic Vibration Trigger ---
-                # When user's gaze is CLEARLY not focused on camera (distinctly left, right, up, down, or head turned)
-                # and user holds a thumb up, thumbs down, thumbs left, or thumbs right (held stable for hold_time),
-                # trigger the wireless vibration motor!
-                thumb_dir = classify_thumb_direction(hand_landmarks, detected_label)
-                gaze_clearly_averted = gaze_info.get("face_detected", False) and gaze_info.get("clear_averted", False)
-                gaze_dir_label = gaze_info.get("direction", "AVERTED")
+                # Only active after Rock-Paper-Scissors has crowned a winner
+                if rps_unlocked:
+                    thumb_dir = classify_thumb_direction(hand_landmarks, detected_label)
+                    gaze_clearly_averted = gaze_info.get("face_detected", False) and gaze_info.get("clear_averted", False)
+                    gaze_dir_label = gaze_info.get("direction", "AVERTED")
 
-                # Debounce: Ensure user is deliberately holding the thumb gesture (not a transient fist transition)
-                if thumb_dir in ("THUMB_UP", "THUMB_DOWN", "THUMB_LEFT", "THUMB_RIGHT"):
-                    if candidate_thumb_dir == thumb_dir:
-                        # Verified thumb gesture held stable
-                        if (now - candidate_thumb_since >= max(0.20, args.hold_time)) and gaze_clearly_averted:
-                            triggered = vibration_controller.trigger_buzz_async(duration=0.30, intensity=255, cooldown=0.80)
-                            if triggered:
-                                last_haptic_buzz_time = now
-                                last_action = f"⚡ HAPTIC MOTOR BUZZ: {thumb_dir} (Gaze: {gaze_dir_label})"
-                                print(f"\n>> {last_action}\n")
+                    # Debounce: Ensure user is deliberately holding the thumb gesture (not a transient fist transition)
+                    if thumb_dir in ("THUMB_UP", "THUMB_DOWN", "THUMB_LEFT", "THUMB_RIGHT"):
+                        if candidate_thumb_dir == thumb_dir:
+                            # Verified thumb gesture held stable
+                            if (now - candidate_thumb_since >= max(0.20, args.hold_time)) and gaze_clearly_averted:
+                                triggered = vibration_controller.trigger_buzz_async(duration=0.30, intensity=255, cooldown=0.80)
+                                if triggered:
+                                    last_haptic_buzz_time = now
+                                    last_action = f"⚡ HAPTIC MOTOR BUZZ: {thumb_dir} (Gaze: {gaze_dir_label})"
+                                    print(f"\n>> {last_action}\n")
+                        else:
+                            candidate_thumb_dir = thumb_dir
+                            candidate_thumb_since = now
                     else:
-                        candidate_thumb_dir = thumb_dir
-                        candidate_thumb_since = now
-                else:
-                    candidate_thumb_dir = None
+                        candidate_thumb_dir = None
 
             # Draw HUD
             haptic_is_active = (time.time() - last_haptic_buzz_time) < 0.50
@@ -1658,7 +1950,9 @@ def main():
                 "y": rel_y,
                 "z": rel_z,
                 "dist": cur_dist,
-                "max": max_boundary
+                "max_fb": max_boundary_fb,
+                "max_vert": max_boundary_vert,
+                "max_lat": max_boundary_lat,
             }
             hud_frame = draw_hud(
                 display_frame,
@@ -1684,8 +1978,8 @@ def main():
                 break
 
             elif key in (ord('r'), ord('R')):
-                rps_game.reset_duel()
-                last_action = "ROCK-PAPER-SCISSORS DUEL RESET! Rematch starting..."
+                rps_game.start_duel()
+                last_action = "ROCK-PAPER-SCISSORS DUEL STARTED! Counting down from 5..."
                 print(f"\n>> {last_action}\n")
 
             elif key in (ord('h'), ord('H')):
@@ -1694,7 +1988,7 @@ def main():
                 rel_y = 0.0
                 rel_z = 0.0
                 home_alt = telemetry.get("altitude", 0.0)
-                last_action = f"DEFAULT POINT SET! (50cm safety box active around Alt: {home_alt:.2f}m)"
+                last_action = f"DEFAULT POINT SET! (Fwd/Bwd ±{int(max_boundary_fb*100)}cm, Alt ±{int(max_boundary_vert*100)}cm around Alt: {home_alt:.2f}m)"
                 print(f"\n>> {last_action}\n")
 
             elif key in (ord('k'), ord('K')):
@@ -1710,6 +2004,11 @@ def main():
                 last_action = "DRONE MOVEMENT ENABLED (Live Flight)" if movement_enabled else "DRONE MOVEMENT DISABLED (Dry Run)"
                 print(f"\n>> {last_action}\n")
 
+            elif key in (ord('i'), ord('I')):
+                is_inv = client.toggleInvertForward()
+                last_action = f"FORWARD/BACKWARD DIRECTION: {'INVERTED' if is_inv else 'NORMAL'}"
+                print(f"\n>> {last_action}\n")
+
             elif key == ord(' '):
                 estop = not estop
                 last_action = "E-STOP ACTIVATED [Gestures Paused]" if estop else "E-STOP RELEASED [Gestures Resumed]"
@@ -1721,22 +2020,22 @@ def main():
                 print(f">> {last_action}")
 
             elif key in (ord('w'), ord('W')):
-                do_action(lambda: client.moveForward(step_dist), f"Manual Move Forward {int(step_dist*100)}cm", delta=(step_dist, 0.0, 0.0))
+                do_action(lambda: client.moveForward(step_fb), f"Manual Move Forward {int(step_fb*100)}cm", delta=(step_fb, 0.0, 0.0))
 
             elif key in (ord('s'), ord('S')):
-                do_action(lambda: client.moveBackward(step_dist), f"Manual Move Backward {int(step_dist*100)}cm", delta=(-step_dist, 0.0, 0.0))
+                do_action(lambda: client.moveBackward(step_fb), f"Manual Move Backward {int(step_fb*100)}cm", delta=(-step_fb, 0.0, 0.0))
 
             elif key in (ord('a'), ord('A')):
-                do_action(lambda: client.moveLeft(step_dist), f"Manual Move Left {int(step_dist*100)}cm", delta=(0.0, -step_dist, 0.0))
+                do_action(lambda: client.moveLeft(step_lat), f"Manual Move Left {int(step_lat*100)}cm", delta=(0.0, -step_lat, 0.0))
 
             elif key in (ord('d'), ord('D')):
-                do_action(lambda: client.moveRight(step_dist), f"Manual Move Right {int(step_dist*100)}cm", delta=(0.0, step_dist, 0.0))
+                do_action(lambda: client.moveRight(step_lat), f"Manual Move Right {int(step_lat*100)}cm", delta=(0.0, step_lat, 0.0))
 
             elif key in (ord('u'), ord('U')):
-                do_action(lambda: client.moveUp(step_dist), f"Manual Move Up {int(step_dist*100)}cm", delta=(0.0, 0.0, step_dist))
+                do_action(lambda: client.moveUp(step_vert), f"Manual Move Up {int(step_vert*100)}cm", delta=(0.0, 0.0, step_vert))
 
             elif key in (ord('j'), ord('J')):
-                do_action(lambda: client.moveDown(step_dist), f"Manual Move Down {int(step_dist*100)}cm", delta=(0.0, 0.0, -step_dist))
+                do_action(lambda: client.moveDown(step_vert), f"Manual Move Down {int(step_vert*100)}cm", delta=(0.0, 0.0, -step_vert))
 
             elif key in (ord('q'), ord('Q')):
                 do_action(lambda: client.rotateCounterClockwise(step_angle), f"Manual Rotate CCW {step_angle}°", delta=(0.0, 0.0, 0.0))
@@ -1757,13 +2056,15 @@ def main():
                 do_action(lambda: client.captureShot(), "Capture Photo", is_movement=False)
 
             elif key in (ord('+'), ord('=')):
-                step_dist = round(step_dist + 0.05, 2)
-                last_action = f"Step distance set to: {int(step_dist*100)}cm ({step_dist:.2f}m)"
+                step_fb = round(step_fb + 0.05, 2)
+                step_dist = (step_fb, step_vert)
+                last_action = f"Step distance set to: FB {int(step_fb*100)}cm, UD {int(step_vert*100)}cm"
                 print(f">> {last_action}")
 
             elif key in (ord('-'), ord('_')):
-                step_dist = max(0.01, round(step_dist - 0.05, 2))
-                last_action = f"Step distance set to: {int(step_dist*100)}cm ({step_dist:.2f}m)"
+                step_fb = max(0.05, round(step_fb - 0.05, 2))
+                step_dist = (step_fb, step_vert)
+                last_action = f"Step distance set to: FB {int(step_fb*100)}cm, UD {int(step_vert*100)}cm"
                 print(f">> {last_action}")
 
     except KeyboardInterrupt:

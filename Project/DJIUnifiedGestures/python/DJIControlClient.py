@@ -24,7 +24,7 @@ class ControlMode(Enum):
 
 class DJIControlClient:
 
-    def __init__(self, ip: str = "127.0.0.1", port: int = 8080, timeout: float = 8.0) -> None:
+    def __init__(self, ip: str = "127.0.0.1", port: int = 8080, timeout: float = 8.0, invert_forward: bool = False) -> None:
         # Strip protocols and trailing ports if accidentally passed
         clean_ip = ip.strip()
         if clean_ip.startswith("http://"):
@@ -41,6 +41,7 @@ class DJIControlClient:
         self.ip = clean_ip
         self.port = port
         self.timeout = timeout
+        self.invert_forward = invert_forward
         self.server_addr = f"http://{self.ip}:{self.port}"
 
         try:
@@ -48,6 +49,10 @@ class DJIControlClient:
             assert r.content == b"Connected", f"Unexpected response from server: {r.content}"
         except Exception as e:
             raise ConnectionError(f"Could not connect to DJIControlServer at {self.server_addr}: {e}")
+
+    def toggleInvertForward(self) -> bool:
+        self.invert_forward = not self.invert_forward
+        return self.invert_forward
 
     def makeReqAndReturnJSON(self, route: str) -> Dict[str, Any]:
         url = f"{self.server_addr}{route}"
@@ -150,19 +155,29 @@ class DJIControlClient:
         return self.makeReqAndReturnJSON(f'/moveDown/{distance}')
 
     def moveForward(self, distance: float) -> Dict[str, Any]:
-        # On the drone's VirtualStick BODY coordinate frame, pitch velocity/axes are reversed:
-        # Calling Android endpoint /moveBackward/ moves the physical drone Forward.
-        return self.makeReqAndReturnJSON(f'/moveBackward/{distance}')
+        # On DJI MSDK in FlightCoordinateSystem.BODY with RollPitchControlMode.VELOCITY:
+        # - Roll commands velocity along the aircraft's longitudinal X-axis (Forward / Backward).
+        # - Pitch commands velocity along the aircraft's lateral Y-axis (Right / Left).
+        # In MainActivity.kt, /moveRight and /moveLeft set roll (longitudinal axis),
+        # while /moveForward and /moveBackward set pitch (lateral axis).
+        # Calling /moveRight moves the physical drone Forward, and /moveLeft moves it Backward!
+        endpoint = '/moveLeft' if self.invert_forward else '/moveRight'
+        return self.makeReqAndReturnJSON(f'{endpoint}/{distance}')
 
     def moveBackward(self, distance: float) -> Dict[str, Any]:
-        # Calling Android endpoint /moveForward/ moves the physical drone Backward.
-        return self.makeReqAndReturnJSON(f'/moveForward/{distance}')
+        # Roll axis commands longitudinal motion: /moveLeft moves Backward.
+        endpoint = '/moveRight' if self.invert_forward else '/moveLeft'
+        return self.makeReqAndReturnJSON(f'{endpoint}/{distance}')
 
     def moveLeft(self, distance: float) -> Dict[str, Any]:
-        return self.makeReqAndReturnJSON(f'/moveLeft/{distance}')
+        # Pitch axis commands lateral motion on the physical drone:
+        # /moveBackward sets pitch = -speed (moving Left).
+        return self.makeReqAndReturnJSON(f'/moveBackward/{distance}')
 
     def moveRight(self, distance: float) -> Dict[str, Any]:
-        return self.makeReqAndReturnJSON(f'/moveRight/{distance}')
+        # Pitch axis commands lateral motion on the physical drone:
+        # /moveForward sets pitch = +speed (moving Right).
+        return self.makeReqAndReturnJSON(f'/moveForward/{distance}')
 
     def rotateClockwise(self, angle: float) -> Dict[str, Any]:
         return self.makeReqAndReturnJSON(f'/rotateClockwise/{angle}')
@@ -214,9 +229,10 @@ class DJIControlClient:
 
 class MockDJIControlClient:
     """Mock DJI Control Client for local testing & simulation without physical drone."""
-    def __init__(self, ip: str = "127.0.0.1", port: int = 8080):
+    def __init__(self, ip: str = "127.0.0.1", port: int = 8080, invert_forward: bool = False):
         self.ip = ip
         self.port = port
+        self.invert_forward = invert_forward
         self.altitude = 0.0
         self.heading = 0.0
         self.x = 0.0
@@ -227,6 +243,10 @@ class MockDJIControlClient:
         self.control_mode = ControlMode.POSITION
         self.landing_protection = False
         print("[SIMULATOR] Mock DJI Control Client initialized (Virtual Drone).")
+
+    def toggleInvertForward(self) -> bool:
+        self.invert_forward = not self.invert_forward
+        return self.invert_forward
 
     def takeOff(self) -> Dict[str, Any]:
         self.is_flying = True
@@ -280,13 +300,15 @@ class MockDJIControlClient:
         return {"code": 0, "state": "SUCCESS"}
 
     def moveForward(self, distance: float) -> Dict[str, Any]:
-        self.x = round(self.x + distance, 2)
-        print(f"[SIMULATOR] Virtual Drone: Move Forward +{int(distance*100)}cm @ {self.max_speed:.2f} m/s -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
+        d = -distance if self.invert_forward else distance
+        self.x = round(self.x + d, 2)
+        print(f"[SIMULATOR] Virtual Drone: Move Forward {'+' if d>=0 else ''}{int(d*100)}cm @ {self.max_speed:.2f} m/s -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
         return {"code": 0, "state": "SUCCESS"}
 
     def moveBackward(self, distance: float) -> Dict[str, Any]:
-        self.x = round(self.x - distance, 2)
-        print(f"[SIMULATOR] Virtual Drone: Move Backward -{int(distance*100)}cm @ {self.max_speed:.2f} m/s -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
+        d = distance if self.invert_forward else -distance
+        self.x = round(self.x + d, 2)
+        print(f"[SIMULATOR] Virtual Drone: Move Backward {'+' if d>=0 else ''}{int(d*100)}cm @ {self.max_speed:.2f} m/s -> Pos (X:{self.x:+.2f}m, Y:{self.y:+.2f}m)")
         return {"code": 0, "state": "SUCCESS"}
 
     def moveLeft(self, distance: float) -> Dict[str, Any]:
