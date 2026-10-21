@@ -1009,221 +1009,228 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
     """Draws rich aviation HUD with gesture indicators directly onto video frame."""
     h, w, _ = frame.shape
     overlay = frame.copy()
-
-    # Center Crosshair
     cx, cy = w // 2, h // 2
-    cv2.line(overlay, (cx - 20, cy), (cx + 20, cy), (0, 255, 0), 2)
-    cv2.line(overlay, (cx, cy - 20), (cx, cy + 20), (0, 255, 0), 2)
-    cv2.circle(overlay, (cx, cy), 4, (0, 255, 0), -1)
 
-    # Top Status Bar
-    cv2.rectangle(overlay, (0, 0), (w, 50), (20, 20, 20), -1)
+    # Check if currently in Rock-Paper-Scissors game (Waiting or Countdown)
+    rps_active = bool(rps_info and rps_info.get("active", False))
+    rps_state = rps_info.get("state", "WAITING") if rps_active else None
+    in_rps_game = rps_active and (rps_state in ("WAITING", "COUNTDOWN"))
 
-    # Drone Connection Status
-    if telemetry.get("simulator", False):
-        dji_status = "SIMULATOR (WEBCAM)"
-        dji_color = (255, 200, 0)
-    else:
-        dji_status = "CONNECTED" if telemetry["connected"] else "OFFLINE"
-        dji_color = (0, 255, 0) if telemetry["connected"] else (0, 0, 255)
-    cv2.putText(overlay, f"DRONE: {dji_status}", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, dji_color, 2)
+    # When NOT in the RPS game, draw all drone flight UI instruments:
+    if not in_rps_game:
+        # Center Crosshair
+        cv2.line(overlay, (cx - 20, cy), (cx + 20, cy), (0, 255, 0), 2)
+        cv2.line(overlay, (cx, cy - 20), (cx, cy + 20), (0, 255, 0), 2)
+        cv2.circle(overlay, (cx, cy), 4, (0, 255, 0), -1)
 
-    # Telemetry: Altitude & Heading
-    alt_txt = f"ALT: {telemetry['altitude']:.2f} m"
-    hdg_txt = f"HDG: {telemetry['heading']:.1f}°"
-    cv2.putText(overlay, alt_txt, (cx - 190, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
-    cv2.putText(overlay, hdg_txt, (cx - 30, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+        # Top Status Bar
+        cv2.rectangle(overlay, (0, 0), (w, 50), (20, 20, 20), -1)
 
-    # Speed & Step Badges
-    cur_spd = telemetry.get("speed", 0.35)
-    spd_txt = f"SPD: {cur_spd:.2f}m/s"
-    cv2.putText(overlay, spd_txt, (cx + 120, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 180), 2)
-
-    if isinstance(step_dist, (tuple, list)):
-        step_fb, step_vert = step_dist
-    else:
-        step_fb, step_vert = step_dist, 0.10
-    step_fb_cm = int(round(step_fb * 100))
-    step_vert_cm = int(round(step_vert * 100))
-    step_txt = f"STEP: FB {step_fb_cm}cm | UD {step_vert_cm}cm"
-    cv2.putText(overlay, step_txt, (w - 290, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 220, 255), 2)
-
-    # Dry Run / Movement Disabled Warning Banner
-    if not movement_enabled:
-        cv2.rectangle(overlay, (cx - 250, 54), (cx + 250, 86), (0, 140, 255), -1)
-        cv2.putText(overlay, "DRY RUN MODE: MOVEMENT LOCKED [Press M to Unlock]", (cx - 235, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 2)
-
-    # --- Gesture Recognition HUD Card (Top Left) ---
-    card_x, card_y, card_w, card_h = 20, 65, 410, 110
-    cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (25, 25, 30), -1)
-    cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (80, 80, 80), 1)
-
-    label = gesture_info.get("label", "None")
-    score = gesture_info.get("score", 0.0)
-    action = gesture_info.get("action", "HOVER")
-
-    sim_suffix = " [SIMULATED]" if not movement_enabled else ""
-
-    if estop:
-        g_badge = "GESTURES: PAUSED (E-STOP)"
-        g_color = (0, 0, 255)
-        action_txt = "ACTION: PAUSED [Press SPACE]"
-        action_color = (0, 0, 255)
-    elif not gesture_enabled:
-        g_badge = "GESTURES: DISABLED"
-        g_color = (150, 150, 150)
-        action_txt = "ACTION: MANUAL KEYS ONLY [Press G]"
-        action_color = (180, 180, 180)
-    elif label == "RPS_Locked":
-        g_badge = "⚔️ GESTURES: LOCKED (PLAY RPS)"
-        g_color = (0, 200, 255)
-        action_txt = action if action else "ACTION: PRESS [R] TO START RPS DUEL"
-        action_color = (0, 220, 255)
-    elif label == "RPS_Match":
-        g_badge = "⚔️ RPS DUEL IN PROGRESS"
-        g_color = (0, 220, 255)
-        action_txt = "FLIGHT GESTURES: LOCKED FOR DUEL"
-        action_color = (0, 220, 255)
-    else:
-        if label == "Thumb_Up":
-            g_badge = f"👍 THUMB UP ({score:.0%})"
-            g_color = (0, 255, 0) if movement_enabled else (0, 200, 255)
-            action_txt = f"ACTION: CLIMBING (+{step_vert_cm}cm){sim_suffix}"
-            action_color = (0, 255, 0) if movement_enabled else (0, 200, 255)
-        elif label == "Thumb_Down":
-            g_badge = f"👎 THUMB DOWN ({score:.0%})"
-            g_color = (0, 140, 255)
-            action_txt = f"ACTION: DESCENDING (-{step_vert_cm}cm){sim_suffix}"
-            action_color = (0, 140, 255)
-        elif label == "Closing_Hand":
-            spd_val = gesture_info.get("speed", 0.35)
-            spd_tier = gesture_info.get("speed_tier", "NORMAL")
-            g_badge = f"✊ CLOSING HAND [{spd_tier}]"
-            g_color = (0, 255, 180) if movement_enabled else (0, 220, 255)
-            action_txt = f"ACTION: FORWARD (+{step_fb_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
-            action_color = (0, 255, 180) if movement_enabled else (0, 220, 255)
-        elif label == "Opening_Hand":
-            spd_val = gesture_info.get("speed", 0.35)
-            spd_tier = gesture_info.get("speed_tier", "NORMAL")
-            g_badge = f"✋ OPENING HAND [{spd_tier}]"
-            g_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
-            action_txt = f"ACTION: BACKWARD (-{step_fb_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
-            action_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
-        elif label == "Open_Palm":
-            g_badge = f"✋ HAND OPEN ({score:.0%})"
-            g_color = (180, 220, 255)
-            action_txt = "READY: Close hand (fist) -> Forward"
-            action_color = (200, 200, 200)
-        elif label == "Closed_Fist":
-            g_badge = f"✊ HAND CLOSED ({score:.0%})"
-            g_color = (180, 255, 220)
-            action_txt = "READY: Open hand -> Backward"
-            action_color = (200, 200, 200)
+        # Drone Connection Status
+        if telemetry.get("simulator", False):
+            dji_status = "SIMULATOR (WEBCAM)"
+            dji_color = (255, 200, 0)
         else:
-            g_badge = f"HAND: {label} ({score:.0%})" if label != "None" else "HAND: None (Hovering)"
-            g_color = (200, 200, 200)
-            action_txt = "ACTION: HOVER IN PLACE"
-            action_color = (220, 220, 220)
+            dji_status = "CONNECTED" if telemetry["connected"] else "OFFLINE"
+            dji_color = (0, 255, 0) if telemetry["connected"] else (0, 0, 255)
+        cv2.putText(overlay, f"DRONE: {dji_status}", (20, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, dji_color, 2)
 
-    cv2.putText(overlay, g_badge, (card_x + 12, card_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, g_color, 2)
-    cv2.putText(overlay, action_txt, (card_x + 12, card_y + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.58, action_color, 2)
+        # Telemetry: Altitude & Heading
+        alt_txt = f"ALT: {telemetry['altitude']:.2f} m"
+        hdg_txt = f"HDG: {telemetry['heading']:.1f}°"
+        cv2.putText(overlay, alt_txt, (cx - 190, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+        cv2.putText(overlay, hdg_txt, (cx - 30, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
 
-    # Indicator light
-    ind_color = g_color if (gesture_enabled and not estop) else (0, 0, 255)
-    cv2.circle(overlay, (card_x + card_w - 24, card_y + 30), 8, ind_color, -1)
+        # Speed & Step Badges
+        cur_spd = telemetry.get("speed", 0.35)
+        spd_txt = f"SPD: {cur_spd:.2f}m/s"
+        cv2.putText(overlay, spd_txt, (cx + 120, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 180), 2)
 
-    # --- Safety Boundary Box HUD Card (Top Right) ---
-    safe_w, safe_h = 360, 110
-    safe_x, safe_y = max(card_x + card_w + 10, w - safe_w - 20), 65
-    cv2.rectangle(overlay, (safe_x, safe_y), (safe_x + safe_w, safe_y + safe_h), (25, 25, 30), -1)
-    cv2.rectangle(overlay, (safe_x, safe_y), (safe_x + safe_w, safe_y + safe_h), (80, 80, 80), 1)
-
-    max_fb_cm = int(round(safety_info.get("max_fb", 1.00) * 100))
-    max_vert_cm = int(round(safety_info.get("max_vert", 0.30) * 100))
-    max_lat_cm = int(round(safety_info.get("max_lat", 0.50) * 100))
-
-    if safety_info.get("set", False):
-        rx = int(round(safety_info.get("x", 0.0) * 100))
-        ry = int(round(safety_info.get("y", 0.0) * 100))
-        rz = int(round(safety_info.get("z", 0.0) * 100))
-
-        is_limit = (abs(rx) >= max_fb_cm or abs(rz) >= max_vert_cm or abs(ry) >= max_lat_cm)
-        is_near = (abs(rx) >= int(max_fb_cm * 0.75) or abs(rz) >= int(max_vert_cm * 0.75) or abs(ry) >= int(max_lat_cm * 0.75))
-
-        if is_limit:
-            s_color = (0, 0, 255)
-            b_status = "LIMIT REACHED"
-        elif is_near:
-            s_color = (0, 165, 255)
-            b_status = "NEAR BOUNDARY"
+        if isinstance(step_dist, (tuple, list)):
+            step_fb, step_vert = step_dist
         else:
-            s_color = (0, 255, 0)
-            b_status = "SAFE"
+            step_fb, step_vert = step_dist, 0.10
+        step_fb_cm = int(round(step_fb * 100))
+        step_vert_cm = int(round(step_vert * 100))
+        step_txt = f"STEP: FB {step_fb_cm}cm | UD {step_vert_cm}cm"
+        cv2.putText(overlay, step_txt, (w - 290, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 220, 255), 2)
 
-        cv2.putText(overlay, f"SAFETY BOX: ACTIVE (X:±{max_fb_cm} Z:±{max_vert_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, s_color, 2)
-        cv2.putText(overlay, f"OFFSET: X:{rx:+d} Y:{ry:+d} Z:{rz:+d} cm", (safe_x + 12, safe_y + 56), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (220, 220, 220), 1)
-        cv2.putText(overlay, f"STATUS: [{b_status}] Limits: X±{max_fb_cm} Z±{max_vert_cm}", (safe_x + 12, safe_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.44, s_color, 2)
-        cv2.putText(overlay, "Press [H] to Re-anchor | [K] to Clear", (safe_x + 12, safe_y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 160, 160), 1)
-        cv2.circle(overlay, (safe_x + safe_w - 20, safe_y + 26), 7, s_color, -1)
-    else:
-        cv2.putText(overlay, f"SAFETY BOX: UNSET (X:±{max_fb_cm} Z:±{max_vert_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 140, 255), 2)
-        cv2.putText(overlay, "Press [H] to Set Default Point", (safe_x + 12, safe_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2)
-        cv2.putText(overlay, f"Limits: Fwd/Bwd ±{max_fb_cm}cm | Alt ±{max_vert_cm}cm", (safe_x + 12, safe_y + 84), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 180, 180), 1)
-        cv2.putText(overlay, "[H] Anchor Default Point", (safe_x + 12, safe_y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1)
-        cv2.circle(overlay, (safe_x + safe_w - 20, safe_y + 26), 7, (0, 140, 255), -1)
+        # Dry Run / Movement Disabled Warning Banner
+        if not movement_enabled:
+            cv2.rectangle(overlay, (cx - 250, 54), (cx + 250, 86), (0, 140, 255), -1)
+            cv2.putText(overlay, "DRY RUN MODE: MOVEMENT LOCKED [Press M to Unlock]", (cx - 235, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 2)
 
-    # --- Gaze Tracking HUD Card (Below Gesture Card) ---
-    if gaze_info is not None:
-        gaze_x, gaze_y, gaze_w, gaze_h = card_x, card_y + card_h + 10, card_w, 82
-        cv2.rectangle(overlay, (gaze_x, gaze_y), (gaze_x + gaze_w, gaze_y + gaze_h), (25, 25, 30), -1)
-        cv2.rectangle(overlay, (gaze_x, gaze_y), (gaze_x + gaze_w, gaze_y + gaze_h), (80, 80, 80), 1)
+        # --- Gesture Recognition HUD Card (Top Left) ---
+        card_x, card_y, card_w, card_h = 20, 65, 410, 110
+        cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (25, 25, 30), -1)
+        cv2.rectangle(overlay, (card_x, card_y), (card_x + card_w, card_y + card_h), (80, 80, 80), 1)
 
-        face_found = gaze_info.get("face_detected", False)
-        is_looking = gaze_info.get("looking_at_camera", False)
-        direction = gaze_info.get("direction", "NO FACE")
-        conf = gaze_info.get("confidence", 0.0)
-        h_ratio = gaze_info.get("horizontal_ratio", 0.50)
-        v_ratio = gaze_info.get("vertical_ratio", 0.50)
+        label = gesture_info.get("label", "None")
+        score = gesture_info.get("score", 0.0)
+        action = gesture_info.get("action", "HOVER")
 
-        if not face_found:
-            gz_title = "👀 GAZE: NO FACE DETECTED"
-            gz_color = (130, 130, 130)
-            gz_sub = "Status: Position face toward camera"
-            gz_sub_col = (160, 160, 160)
-        elif is_looking:
-            gz_title = "👀 GAZE: LOOKING AT CAMERA"
-            gz_color = (0, 255, 120)
-            gz_sub = f"Status: {direction} (H:{h_ratio:.2f}, V:{v_ratio:.2f}, {conf:.0%})"
-            gz_sub_col = (0, 255, 180)
+        sim_suffix = " [SIMULATED]" if not movement_enabled else ""
+
+        if estop:
+            g_badge = "GESTURES: PAUSED (E-STOP)"
+            g_color = (0, 0, 255)
+            action_txt = "ACTION: PAUSED [Press SPACE]"
+            action_color = (0, 0, 255)
+        elif not gesture_enabled:
+            g_badge = "GESTURES: DISABLED"
+            g_color = (150, 150, 150)
+            action_txt = "ACTION: MANUAL KEYS ONLY [Press G]"
+            action_color = (180, 180, 180)
+        elif label == "RPS_Locked":
+            g_badge = "⚔️ GESTURES: LOCKED (PLAY RPS)"
+            g_color = (0, 200, 255)
+            action_txt = action if action else "ACTION: PRESS [R] TO START RPS DUEL"
+            action_color = (0, 220, 255)
+        elif label == "RPS_Match":
+            g_badge = "⚔️ RPS DUEL IN PROGRESS"
+            g_color = (0, 220, 255)
+            action_txt = "FLIGHT GESTURES: LOCKED FOR DUEL"
+            action_color = (0, 220, 255)
         else:
-            gz_title = f"👀 GAZE: {direction}"
-            gz_color = (0, 140, 255)
-            gz_sub = f"Status: AVERTED (H:{h_ratio:.2f}, V:{v_ratio:.2f}, {conf:.0%})"
-            gz_sub_col = (0, 180, 255)
+            if label == "Thumb_Up":
+                g_badge = f"👍 THUMB UP ({score:.0%})"
+                g_color = (0, 255, 0) if movement_enabled else (0, 200, 255)
+                action_txt = f"ACTION: CLIMBING (+{step_vert_cm}cm){sim_suffix}"
+                action_color = (0, 255, 0) if movement_enabled else (0, 200, 255)
+            elif label == "Thumb_Down":
+                g_badge = f"👎 THUMB DOWN ({score:.0%})"
+                g_color = (0, 140, 255)
+                action_txt = f"ACTION: DESCENDING (-{step_vert_cm}cm){sim_suffix}"
+                action_color = (0, 140, 255)
+            elif label == "Closing_Hand":
+                spd_val = gesture_info.get("speed", 0.35)
+                spd_tier = gesture_info.get("speed_tier", "NORMAL")
+                g_badge = f"✊ CLOSING HAND [{spd_tier}]"
+                g_color = (0, 255, 180) if movement_enabled else (0, 220, 255)
+                action_txt = f"ACTION: FORWARD (+{step_fb_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
+                action_color = (0, 255, 180) if movement_enabled else (0, 220, 255)
+            elif label == "Opening_Hand":
+                spd_val = gesture_info.get("speed", 0.35)
+                spd_tier = gesture_info.get("speed_tier", "NORMAL")
+                g_badge = f"✋ OPENING HAND [{spd_tier}]"
+                g_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
+                action_txt = f"ACTION: BACKWARD (-{step_fb_cm}cm @ {spd_val:.2f}m/s){sim_suffix}"
+                action_color = (0, 165, 255) if movement_enabled else (100, 200, 255)
+            elif label == "Open_Palm":
+                g_badge = f"✋ HAND OPEN ({score:.0%})"
+                g_color = (180, 220, 255)
+                action_txt = "READY: Close hand (fist) -> Forward"
+                action_color = (200, 200, 200)
+            elif label == "Closed_Fist":
+                g_badge = f"✊ HAND CLOSED ({score:.0%})"
+                g_color = (180, 255, 220)
+                action_txt = "READY: Open hand -> Backward"
+                action_color = (200, 200, 200)
+            else:
+                g_badge = f"HAND: {label} ({score:.0%})" if label != "None" else "HAND: None (Hovering)"
+                g_color = (200, 200, 200)
+                action_txt = "ACTION: HOVER IN PLACE"
+                action_color = (220, 220, 220)
 
-        cv2.putText(overlay, gz_title, (gaze_x + 12, gaze_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.60, gz_color, 2)
-        cv2.putText(overlay, gz_sub, (gaze_x + 12, gaze_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, gz_sub_col, 1)
-        cv2.circle(overlay, (gaze_x + gaze_w - 24, gaze_y + 26), 8, gz_color, -1)
+        cv2.putText(overlay, g_badge, (card_x + 12, card_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, g_color, 2)
+        cv2.putText(overlay, action_txt, (card_x + 12, card_y + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.58, action_color, 2)
 
-        # Draw subtle eye iris tracking reticles directly on eyes if detected
-        iris_l = gaze_info.get("iris_left")
-        iris_r = gaze_info.get("iris_right")
-        reticle_color = (0, 255, 120) if is_looking else (0, 165, 255)
-        if iris_l and iris_l[0] > 0 and iris_l[1] > 0:
-            cv2.circle(overlay, iris_l, 4, reticle_color, -1)
-            cv2.circle(overlay, iris_l, 8, reticle_color, 1)
-        if iris_r and iris_r[0] > 0 and iris_r[1] > 0:
-            cv2.circle(overlay, iris_r, 4, reticle_color, -1)
-            cv2.circle(overlay, iris_r, 8, reticle_color, 1)
+        # Indicator light
+        ind_color = g_color if (gesture_enabled and not estop) else (0, 0, 255)
+        cv2.circle(overlay, (card_x + card_w - 24, card_y + 30), 8, ind_color, -1)
 
-    # --- Haptic Vibration Alert Indicator ---
-    if haptic_active:
-        hap_w, hap_h = 360, 48
-        hap_x = w - hap_w - 20
-        hap_y = 185
-        cv2.rectangle(overlay, (hap_x, hap_y), (hap_x + hap_w, hap_y + hap_h), (0, 0, 180), -1)
-        cv2.rectangle(overlay, (hap_x, hap_y), (hap_x + hap_w, hap_y + hap_h), (0, 255, 255), 2)
-        cv2.putText(overlay, "⚡ HAPTIC MOTOR BUZZ ACTIVE", (hap_x + 14, hap_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
+        # --- Safety Boundary Box HUD Card (Top Right) ---
+        safe_w, safe_h = 360, 110
+        safe_x, safe_y = max(card_x + card_w + 10, w - safe_w - 20), 65
+        cv2.rectangle(overlay, (safe_x, safe_y), (safe_x + safe_w, safe_y + safe_h), (25, 25, 30), -1)
+        cv2.rectangle(overlay, (safe_x, safe_y), (safe_x + safe_w, safe_y + safe_h), (80, 80, 80), 1)
+
+        max_fb_cm = int(round(safety_info.get("max_fb", 1.00) * 100))
+        max_vert_cm = int(round(safety_info.get("max_vert", 0.30) * 100))
+        max_lat_cm = int(round(safety_info.get("max_lat", 0.50) * 100))
+
+        if safety_info.get("set", False):
+            rx = int(round(safety_info.get("x", 0.0) * 100))
+            ry = int(round(safety_info.get("y", 0.0) * 100))
+            rz = int(round(safety_info.get("z", 0.0) * 100))
+
+            is_limit = (abs(rx) >= max_fb_cm or abs(rz) >= max_vert_cm or abs(ry) >= max_lat_cm)
+            is_near = (abs(rx) >= int(max_fb_cm * 0.75) or abs(rz) >= int(max_vert_cm * 0.75) or abs(ry) >= int(max_lat_cm * 0.75))
+
+            if is_limit:
+                s_color = (0, 0, 255)
+                b_status = "LIMIT REACHED"
+            elif is_near:
+                s_color = (0, 165, 255)
+                b_status = "NEAR BOUNDARY"
+            else:
+                s_color = (0, 255, 0)
+                b_status = "SAFE"
+
+            cv2.putText(overlay, f"SAFETY BOX: ACTIVE (X:±{max_fb_cm} Z:±{max_vert_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, s_color, 2)
+            cv2.putText(overlay, f"OFFSET: X:{rx:+d} Y:{ry:+d} Z:{rz:+d} cm", (safe_x + 12, safe_y + 56), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (220, 220, 220), 1)
+            cv2.putText(overlay, f"STATUS: [{b_status}] Limits: X±{max_fb_cm} Z±{max_vert_cm}", (safe_x + 12, safe_y + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.44, s_color, 2)
+            cv2.putText(overlay, "Press [H] to Re-anchor | [K] to Clear", (safe_x + 12, safe_y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 160, 160), 1)
+            cv2.circle(overlay, (safe_x + safe_w - 20, safe_y + 26), 7, s_color, -1)
+        else:
+            cv2.putText(overlay, f"SAFETY BOX: UNSET (X:±{max_fb_cm} Z:±{max_vert_cm}cm)", (safe_x + 12, safe_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 140, 255), 2)
+            cv2.putText(overlay, "Press [H] to Set Default Point", (safe_x + 12, safe_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2)
+            cv2.putText(overlay, f"Limits: Fwd/Bwd ±{max_fb_cm}cm | Alt ±{max_vert_cm}cm", (safe_x + 12, safe_y + 84), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 180, 180), 1)
+            cv2.putText(overlay, "[H] Anchor Default Point", (safe_x + 12, safe_y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1)
+            cv2.circle(overlay, (safe_x + safe_w - 20, safe_y + 26), 7, (0, 140, 255), -1)
+
+        # --- Gaze Tracking HUD Card (Below Gesture Card) ---
+        if gaze_info is not None:
+            gaze_x, gaze_y, gaze_w, gaze_h = card_x, card_y + card_h + 10, card_w, 82
+            cv2.rectangle(overlay, (gaze_x, gaze_y), (gaze_x + gaze_w, gaze_y + gaze_h), (25, 25, 30), -1)
+            cv2.rectangle(overlay, (gaze_x, gaze_y), (gaze_x + gaze_w, gaze_y + gaze_h), (80, 80, 80), 1)
+
+            face_found = gaze_info.get("face_detected", False)
+            is_looking = gaze_info.get("looking_at_camera", False)
+            direction = gaze_info.get("direction", "NO FACE")
+            conf = gaze_info.get("confidence", 0.0)
+            h_ratio = gaze_info.get("horizontal_ratio", 0.50)
+            v_ratio = gaze_info.get("vertical_ratio", 0.50)
+
+            if not face_found:
+                gz_title = "👀 GAZE: NO FACE DETECTED"
+                gz_color = (130, 130, 130)
+                gz_sub = "Status: Position face toward camera"
+                gz_sub_col = (160, 160, 160)
+            elif is_looking:
+                gz_title = "👀 GAZE: LOOKING AT CAMERA"
+                gz_color = (0, 255, 120)
+                gz_sub = f"Status: {direction} (H:{h_ratio:.2f}, V:{v_ratio:.2f}, {conf:.0%})"
+                gz_sub_col = (0, 255, 180)
+            else:
+                gz_title = f"👀 GAZE: {direction}"
+                gz_color = (0, 140, 255)
+                gz_sub = f"Status: AVERTED (H:{h_ratio:.2f}, V:{v_ratio:.2f}, {conf:.0%})"
+                gz_sub_col = (0, 180, 255)
+
+            cv2.putText(overlay, gz_title, (gaze_x + 12, gaze_y + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.60, gz_color, 2)
+            cv2.putText(overlay, gz_sub, (gaze_x + 12, gaze_y + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, gz_sub_col, 1)
+            cv2.circle(overlay, (gaze_x + gaze_w - 24, gaze_y + 26), 8, gz_color, -1)
+
+            # Draw subtle eye iris tracking reticles directly on eyes if detected
+            iris_l = gaze_info.get("iris_left")
+            iris_r = gaze_info.get("iris_right")
+            reticle_color = (0, 255, 120) if is_looking else (0, 165, 255)
+            if iris_l and iris_l[0] > 0 and iris_l[1] > 0:
+                cv2.circle(overlay, iris_l, 4, reticle_color, -1)
+                cv2.circle(overlay, iris_l, 8, reticle_color, 1)
+            if iris_r and iris_r[0] > 0 and iris_r[1] > 0:
+                cv2.circle(overlay, iris_r, 4, reticle_color, -1)
+                cv2.circle(overlay, iris_r, 8, reticle_color, 1)
+
+        # --- Haptic Vibration Alert Indicator ---
+        if haptic_active:
+            hap_w, hap_h = 360, 48
+            hap_x = w - hap_w - 20
+            hap_y = 185
+            cv2.rectangle(overlay, (hap_x, hap_y), (hap_x + hap_w, hap_y + hap_h), (0, 0, 180), -1)
+            cv2.rectangle(overlay, (hap_x, hap_y), (hap_x + hap_w, hap_y + hap_h), (0, 255, 255), 2)
+            cv2.putText(overlay, "⚡ HAPTIC MOTOR BUZZ ACTIVE", (hap_x + 14, hap_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
 
     # --- Rock-Paper-Scissors Duel Overlay ---
     if rps_info and rps_info.get("active", False):
@@ -1335,15 +1342,16 @@ def draw_hud(frame, telemetry, step_dist, gesture_info, estop, gesture_enabled, 
             confetti_effect.update_and_draw(overlay, w, h, time.time())
             cv2.putText(overlay, "🎉 WINNER! 👑", (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 120), 2)
 
-    # Bottom Control Bar
-    cv2.rectangle(overlay, (0, h - 45), (w, h), (20, 20, 20), -1)
-    controls_txt = "[R] RPS Rematch | [H] Anchor Pt | [M] Move Lock | [I] Invert Fwd | [SPACE] E-Stop | [G] Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land"
-    cv2.putText(overlay, controls_txt, (15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1)
+    # Bottom Control Bar & Last Action Banner (Only when NOT in RPS game)
+    if not in_rps_game:
+        cv2.rectangle(overlay, (0, h - 45), (w, h), (20, 20, 20), -1)
+        controls_txt = "[R] RPS Rematch | [H] Anchor Pt | [M] Move Lock | [I] Invert Fwd | [SPACE] E-Stop | [G] Gestures | [W/S/A/D] Move | [T] Takeoff | [L] Land"
+        cv2.putText(overlay, controls_txt, (15, h - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1)
 
-    # Last Action Banner
-    if last_action:
-        color = (0, 0, 255) if "BLOCKED" in last_action else (0, 255, 200)
-        cv2.putText(overlay, f"> {last_action}", (20, h - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+        # Last Action Banner
+        if last_action:
+            color = (0, 0, 255) if "BLOCKED" in last_action else (0, 255, 200)
+            cv2.putText(overlay, f"> {last_action}", (20, h - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
 
     alpha = 0.88
     return cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
