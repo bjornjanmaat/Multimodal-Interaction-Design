@@ -51,7 +51,7 @@ from DJIControlClient import DJIControlClient, ControlMode, MockDJIControlClient
 
 
 class ArduinoVibrationController:
-    """Manages wireless UDP haptic feedback communication to Arduino vibration motor."""
+    """Manages wireless UDP haptic feedback communication to Arduino vibration motors (M1-M4)."""
     def __init__(self, ip="10.114.198.176", port=5005):
         self.ip = ip
         self.port = port
@@ -59,15 +59,32 @@ class ArduinoVibrationController:
         self.last_trigger_time = 0.0
         self.active_buzz_thread = None
 
-    def set_vibration(self, level: int):
-        """Sets motor speed from 0 (off) to 255 (maximum)."""
-        level = max(0, min(255, level))
+    def set_vibration(self, level: int, motor=None):
+        """Sets motor vibration level (0-255). If motor is None, sets all M1-M4 motors."""
+        level = max(0, min(255, int(level)))
         try:
-            self.sock.sendto(str(level).encode(), (self.ip, self.port))
-        except Exception as e:
+            if motor is None:
+                payload = str(level)
+            elif motor in (1, 2, 3, 4):
+                payload = f"M{motor}:{level}"
+            else:
+                payload = str(level)
+            self.sock.sendto(payload.encode(), (self.ip, self.port))
+        except Exception:
             pass
 
-    def trigger_buzz_async(self, duration=0.30, intensity=255, cooldown=0.80):
+    def set_motors(self, m1=0, m2=0, m3=0, m4=0):
+        """Sets independent intensities (0-255) for M1, M2, M3, M4."""
+        m1 = max(0, min(255, int(m1)))
+        m2 = max(0, min(255, int(m2)))
+        m3 = max(0, min(255, int(m3)))
+        m4 = max(0, min(255, int(m4)))
+        try:
+            self.sock.sendto(f"{m1},{m2},{m3},{m4}".encode(), (self.ip, self.port))
+        except Exception:
+            pass
+
+    def trigger_buzz_async(self, duration=0.30, intensity=255, motor=None, cooldown=0.80):
         """Triggers a vibration pulse in a background thread without blocking the video loop."""
         now = time.time()
         if now - self.last_trigger_time < cooldown:
@@ -76,9 +93,9 @@ class ArduinoVibrationController:
 
         def _buzz():
             try:
-                self.set_vibration(intensity)
+                self.set_vibration(intensity, motor=motor)
                 time.sleep(duration)
-                self.set_vibration(0)
+                self.set_vibration(0, motor=motor)
             except Exception:
                 pass
 
